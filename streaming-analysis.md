@@ -22,9 +22,22 @@ Route::middleware('audio.auth')->group(static function (): void {
 ```
 HTTP Request
     ↓
+[Sanctum Token 解析] 从查询参数/header/cookie 中提取 token
+    ↓
+[AuthServiceProvider::viaRequest] token-via-query-parameter Guard
+    ├─ 优先: $request->get('api_token')
+    └─ 回退: $request->get('t')
+    ↓
+[TokenManager::getUserFromPlainTextToken] 验证 token 有效性
+    ↓
 [bootstrap/app.php] 中间件注册
     ↓
 [AudioAuthenticate] audio.auth 中间件
+    │  check: $request->user()?->tokenCan('audio')
+    │  token 必须具备 'audio' 能力
+    │
+    ├─ api-token: 具备 '*' 能力，通过校验
+    └─ audio-token: 仅具备 'audio' 能力，通过校验
     ↓
 [Route Model Binding] Song $song 注入
     ↓
@@ -38,6 +51,136 @@ HTTP Request
         ↓
 [StreamerAdapter::stream] 实际流式输出
 ```
+
+---
+
+## 1.3 复合 Token 机制
+
+### CompositeToken 设计
+
+**文件**: `app/Values/CompositeToken.php:9-42`
+
+```php
+/**
+ * A "composite token" consists of two tokens:
+ *
+ * - an API token, which has all abilities
+ * - an audio token, which has only the "audio" ability i.e. to play and download audio files. This token is used for
+ * the audio player on the frontend as part of the GET query string, and thus has limited privileges.
+ *
+ * This approach helps prevent the API token from being logged by servers and proxies.
+ */
+final readonly class CompositeToken implements Arrayable
+{
+    private function __construct(
+        public string $apiToken,      // 具备 '*' 全部能力
+        public string $audioToken,    // 仅具备 'audio' 能力
+    ) {}
+
+    public static function fromAccessTokens(NewAccessToken $api, NewAccessToken $audio): self
+    {
+        return new self($api->plainTextToken, $audio->plainTextToken);
+    }
+
+    public function toArray(): array
+    {
+        return [
+            'token' => $this->apiToken,
+            'audio-token' => $this->audioToken,
+        ];
+    }
+}
+```
+
+### Token 创建与关联
+
+**文件**: `app/Services/Auth/TokenManager.php:19-29`
+
+```php
+public function createCompositeToken(User $user): CompositeToken
+{
+    $token = CompositeToken::fromAccessTokens(
+        api: $this->createToken($user),           // 能力: ['*']
+        audio: $this->createToken($user, ['audio']), // 能力: ['audio']
+    );
+
+    // 建立 apiToken → audioToken 的缓存映射，用于级联删除
+    Cache::forever("app.composite-tokens.$token->apiToken", $token->audioToken);
+
+    return $token;
+}
+```
+
+**Token 级联删除** ([`TokenManager.php:31-42`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\app\Services\Auth\TokenManager.php#L31-L42)):
+```php
+public function deleteCompositionToken(string $plainTextApiToken): void
+{
+    $audioToken = Cache::get("app.composite-tokens.$plainTextApiToken");
+
+    if ($audioToken) {
+        $this->deleteTokenByPlainTextToken($audioToken);
+        Cache::forget("app.composite-tokens.$plainTextApiToken");
+    }
+
+    $this->deleteTokenByPlainTextToken($plainTextApiToken);
+}
+```
+
+### 前端 Token 选择
+
+**文件**: `resources/assets/js/stores/playableStore.ts:193-197`
+
+```typescript
+getSourceUrl: (playable: Playable) => {
+  return isMobile.any && preferenceStore.transcode_on_mobile
+    ? `${commonStore.state.cdn_url}play/${playable.id}/1?t=${authService.getAudioToken()}`
+    : `${commonStore.state.cdn_url}play/${playable.id}?t=${authService.getAudioToken()}`
+},
+```
+
+- **音频播放 URL 使用 `audioToken`**：最小权限原则，即使被日志记录也只能播放音频
+- **API 请求使用 `apiToken`**：具备完整操作能力
+
+---
+
+## 1.4 查询参数认证的等价处理
+
+### Token 回退逻辑
+
+**文件**: `app/Providers/AuthServiceProvider.php:20-24`
+
+```php
+Auth::viaRequest('token-via-query-parameter', static function (Request $request): ?User {
+    $token = $request->get('api_token') ?: $request->get('t');
+
+    return app(TokenManager::class)->getUserFromPlainTextToken($token ?: '');
+});
+```
+
+**优先级**：
+1. **`api_token`**：传统参数名，向后兼容
+2. **`t`**：短参数名，减少 URL 长度，前端默认使用
+3. 两者都为空时返回 `null`，认证失败
+
+### 两种 Token 的等价性
+
+| Token 类型 | 能力 | `tokenCan('audio')` | 可用于播放 | 可用于 API |
+|----------|------|---------------------|-----------|-----------|
+| `apiToken` | `['*']` | ✅ 通过 | ✅ 是 | ✅ 是 |
+| `audioToken` | `['audio']` | ✅ 通过 | ✅ 是 | ❌ 否 |
+
+**安全设计**：
+- `t` 参数值使用 `audioToken`（仅 `audio` 能力）
+- 即使 URL 被服务器日志、代理服务器记录，泄露的 Token 也只能播放音频
+- 完整 API Token 不会出现在 GET 请求的查询参数中
+
+### 潜在边界风险
+
+| 场景 | 风险 | 影响 |
+|-----|------|------|
+| 使用 `api_token` 播放 | `api_token` 被日志记录 | 全权限 Token 泄露，风险高 |
+| URL 共享给他人 | `audioToken` 泄露 | 他人可播放你的私有歌曲，直到 Token 失效 |
+| Token 过期 | Sanctum Token 过期时间由配置决定 | 播放 URL 可能失效（缓存的 URL 无法播放） |
 
 ---
 
@@ -633,7 +776,96 @@ $this->get("play/{$song->id}/1?t=$token->audioToken")->assertOk();
 - 请求头: `Authorization: Bearer {token}`
 - Cookie: Laravel Session Cookie
 
-### 3.8.4 `transcode` 路由参数处理
+### 3.8.4 Service Worker 缓存与 Token 处理
+
+**缓存 Key 标准化** ([`service-worker.ts:8-17`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\resources\assets\js\service-worker.ts#L8-L17)):
+
+```typescript
+/**
+ * Normalize a play URL to a stable cache key by stripping the auth token query param.
+ * e.g. "https://example.com/play/abc123?t=token" -> "https://example.com/play/abc123"
+ *      "https://example.com/play/abc123/1?t=token" -> "https://example.com/play/abc123/1"
+ */
+const normalizeCacheKey = (url: string): string => {
+  const u = new URL(url)
+  u.searchParams.delete('t')
+  return u.toString()
+}
+```
+
+**缓存 Key 语义**:
+- **去除 `t` 参数**：Token 是用户特定的，不应该影响缓存键
+- **保留 `{transcode}` 路径段**：转码与直出是不同的音频流，分开缓存
+- **示例**:
+  - `/play/abc123?t=token1` → `/play/abc123`
+  - `/play/abc123?t=token2` → `/play/abc123` (同一首歌，不同用户共享缓存)
+  - `/play/abc123/1?t=token` → `/play/abc123/1` (转码版本独立缓存)
+
+**Service Worker 播放请求处理** ([`service-worker.ts:66-78`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\resources\assets\js\service-worker.ts#L66-L78)):
+
+```typescript
+const handlePlayRequest = async (request: Request): Promise<Response> => {
+  const cache = await caches.open(AUDIO_CACHE_NAME)
+  const cacheKey = normalizeCacheKey(request.url)
+  const cached = await cache.match(cacheKey)
+
+  if (cached) {
+    return handleRangeRequest(request, cached)
+  }
+
+  // Not cached — fetch from network and let it stream through.
+  // We do NOT cache on-the-fly here; caching is done proactively via the CACHE_AUDIO message.
+  return fetch(request)
+}
+```
+
+**缓存命中时的 Range 支持** ([`service-worker.ts:84-113`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\resources\assets\js\service-worker.ts#L84-L113)):
+```typescript
+const handleRangeRequest = async (request: Request, cached: Response): Promise<Response> => {
+  const rangeHeader = request.headers.get('Range')
+  
+  if (!rangeHeader) return cached
+  
+  const blob = await cached.blob()
+  const totalSize = blob.size
+  const match = rangeHeader.match(/bytes=(\d+)-(\d*)/)
+  
+  if (!match) return cached
+  
+  const start = Number(match[1])
+  const end = match[2] ? Number(match[2]) : totalSize - 1
+  const sliced = blob.slice(start, end + 1)
+  
+  return new Response(sliced, {
+    status: 206,
+    statusText: 'Partial Content',
+    headers: {
+      'Content-Type': cached.headers.get('Content-Type') || 'audio/mpeg',
+      'Content-Length': String(sliced.size),
+      'Content-Range': `bytes ${start}-${end}/${totalSize}`,
+      'Accept-Ranges': 'bytes',
+    },
+  })
+}
+```
+
+### 3.8.5 缓存设计的潜在影响
+
+| 设计决策 | 语义 | 潜在影响 |
+|---------|------|---------|
+| **去除 Token 做缓存键** | 同歌曲不同用户共享缓存 | ✅ 节省存储空间<br>✅ 离线播放可用<br>⚠️ 多用户共享设备时可能泄露私有歌曲 |
+| **转码路径独立缓存** | `/play/{id}` 与 `/play/{id}/1` 分开缓存 | ✅ 转码与直出互不干扰<br>⚠️ 同一首歌可能占用 2 份存储空间 |
+| **不即时缓存播放流** | 只缓存用户主动标记的离线歌曲 | ✅ 不浪费带宽缓存不常听的歌<br>⚠️ 首次播放无缓存加速 |
+| **SW 自实现 Range 支持** | 缓存命中时用 Blob.slice 处理 Range | ✅ 离线播放支持 seek<br>⚠️ 大文件 seek 时内存占用高 |
+| **仅删除 `t` 参数** | `api_token` 参数会影响缓存键 | ✅ `t` 参数是标准用法<br>⚠️ 使用 `api_token` 播放的 URL 无法命中缓存 |
+
+**缓存边界条件**:
+1. **Token 过期不影响缓存**：缓存键不包含 Token，Token 过期后缓存仍可使用（离线场景）
+2. **用户登出需手动清理**：调用 `DELETE_AUDIO_CACHE` 消息删除缓存
+3. **跨用户缓存隔离**：Service Worker 缓存是按源隔离的，不同域名/用户账户不会共享
+4. **转码缓存与直出缓存独立**：用户切换转码设置后需重新缓存
+
+### 3.8.6 `transcode` 路由参数处理
 
 **路由定义**: `Route::get('play/{song}/{transcode?}', PlayController::class)`
 
@@ -1073,6 +1305,11 @@ public function stream(Song $song, ?RequestedStreamingConfig $config = null): Re
 | 前端不传递 time 参数 | playableStore.ts:193-197 | 服务端未实现 seek 功能 | 预留代码无实际用途 |
 | startTime 参数完整链路预留 | PlayController.php:32 | 为未来服务端 seek 预留接口 | 传递链路完整但无实际效果 |
 | transcode 路由参数无类型约束 | routes/web.base.php:48 | 简化路由定义 | 依赖 `(bool)` 强制转换的隐式行为 |
+| 复合 Token 双轨设计 | CompositeToken.php:18 | 最小权限原则，保护 API Token | Token 管理复杂度增加 |
+| 查询参数 Token 双名等价 | AuthServiceProvider.php:21 | 向后兼容 + 缩短 URL | `api_token` 缓存不命中 |
+| Service Worker 去除 Token 做缓存键 | service-worker.ts:15 | 同歌曲跨用户共享缓存 | 需手动处理登出缓存清理 |
+| SW 自实现 Range 支持 | service-worker.ts:84-113 | 离线播放支持 seek | 大文件内存占用高 |
+| 不即时缓存播放流 | service-worker.ts:77 | 不浪费带宽缓存不常听的歌 | 首次播放无缓存加速 |
 
 ---
 
@@ -1115,3 +1352,6 @@ public function stream(Song $song, ?RequestedStreamingConfig $config = null): Re
 2. **`SongPlayRequest` 无验证**：空类仅用于类型约束，所有参数验证依赖 PHP 隐式类型转换
 3. **前端播放控制完全在浏览器端**：服务端不干预播放起始位置、进度控制等，仅提供音频数据流
 4. **转码决策双路径**：既可通过 URL 参数 `{transcode}` 强制转码，也可根据 MIME 类型自动判断
+5. **Token 双轨机制**：`apiToken` 具备全部能力用于 API，`audioToken` 仅具备 `audio` 能力用于播放 URL
+6. **查询参数双名等价**：`api_token` 与 `t` 均可用于认证，优先级 `api_token` > `t`
+7. **Service Worker 缓存无状态**：缓存键去除 Token，支持离线播放但需手动处理登出清理
