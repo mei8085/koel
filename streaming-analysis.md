@@ -524,7 +524,138 @@ class SftpStreamerAdapter implements StreamerAdapter
 
 ---
 
-## 3.8 startTime 参数分析
+## 3.8 播放请求输入侧边界分析
+
+### 3.8.1 前端播放 URL 组装
+
+**文件**: `resources/assets/js/stores/playableStore.ts:193-197`
+
+```typescript
+getSourceUrl: (playable: Playable) => {
+  return isMobile.any && preferenceStore.transcode_on_mobile
+    ? `${commonStore.state.cdn_url}play/${playable.id}/1?t=${authService.getAudioToken()}`
+    : `${commonStore.state.cdn_url}play/${playable.id}?t=${authService.getAudioToken()}`
+},
+```
+
+**URL 结构分析**:
+
+| 场景 | URL 格式 |
+|-----|---------|
+| 桌面端 | `{cdn_url}play/{song_id}?t={audio_token}` |
+| 移动端 + 转码开启 | `{cdn_url}play/{song_id}/1?t={audio_token}` |
+
+**查询参数说明**:
+- `t`: 音频认证 Token，用于 `audio.auth` 中间件校验
+- **注意**: 前端代码中**不传递 `time` 参数**，`time` 参数只存在于后端代码的预留逻辑中
+
+**测试验证** ([`playableStore.spec.ts:148-158`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\resources\assets\js\stores\playableStore.spec.ts#L148-L158)):
+```typescript
+it('gets source URL', () => {
+  commonStore.state.cdn_url = 'http://test/'
+  const song = h.factory('song').make()
+  h.mock(authService, 'getAudioToken', 'hadouken')
+
+  expect(playableStore.getSourceUrl(song)).toBe(`http://test/play/${song.id}?t=hadouken`)
+
+  isMobile.any = true
+  preferenceStore.temporary.transcode_on_mobile = true
+  expect(playableStore.getSourceUrl(song)).toBe(`http://test/play/${song.id}/1?t=hadouken`)
+})
+```
+
+### 3.8.2 SongPlayRequest 输入约束与默认值
+
+**文件**: `app/Http/Requests/SongPlayRequest.php:1-9`
+
+```php
+/**
+ * @property-read float|string $time
+ * @property-read string $api_token
+ */
+class SongPlayRequest extends Request {}
+```
+
+**继承链**:
+```
+SongPlayRequest
+    ↓ extends
+App\Http\Requests\Request
+    ↓ extends
+Illuminate\Foundation\Http\FormRequest
+```
+
+**关键特征**:
+1. **无验证规则**: `SongPlayRequest` 是空类，没有定义 `rules()` 方法，不做任何参数验证
+2. **PHPDoc 仅用于 IDE 提示**: `@property-read` 注释只为 IDE 提供类型提示，不做实际验证
+3. **属性访问通过 `__get`**: `$request->time` 通过 `FormRequest::__get()` 从请求参数中获取
+
+**参数默认值与类型转换链路**:
+
+```
+HTTP 请求 (无 time 参数)
+    ↓
+FormRequest::__get('time') → null
+    ↓
+PlayController: (float) $request->time → (float) null → 0.0
+    ↓
+RequestedStreamingConfig::make(startTime: 0.0)
+```
+
+**类型转换边界行为**:
+
+| 输入值 | PHP 表达式 | 结果 | 说明 |
+|-------|-----------|------|------|
+| 未传递 | `(float) null` | `0.0` | 空值转为 0.0 |
+| `?time=` | `(float) ""` | `0.0` | 空字符串转为 0.0 |
+| `?time=abc` | `(float) "abc"` | `0.0` | 非数字字符串转为 0.0 |
+| `?time=123` | `(float) "123"` | `123.0` | 正常转换 |
+| `?time=123.45` | `(float) "123.45"` | `123.45` | 正常转换 |
+| `?time=-10` | `(float) "-10"` | `-10.0` | 负值也会被接受 |
+
+**测试验证** ([`SongPlayTest.php`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\tests\Feature\SongPlayTest.php)):
+```php
+// 所有测试用例都不传递 time 参数
+$this->get("play/{$song->id}?t=$token->audioToken")->assertOk();
+$this->get("play/{$song->id}/1?t=$token->audioToken")->assertOk();
+```
+
+### 3.8.3 `t` 参数 (Token) 处理
+
+`audio.auth` 中间件不直接读取 `t` 参数，而是通过 Laravel 的认证系统处理：
+
+1. Sanctum 从请求中提取 Token（支持多种方式：查询参数、Header、Cookie 等）
+2. `$request->user()` 返回认证用户
+3. `AudioAuthenticate` 中间件检查 `$request->user()?->tokenCan('audio')`
+
+**Token 传递方式**:
+- 查询参数: `?t={token}` 或 `?api_token={token}`
+- 请求头: `Authorization: Bearer {token}`
+- Cookie: Laravel Session Cookie
+
+### 3.8.4 `transcode` 路由参数处理
+
+**路由定义**: `Route::get('play/{song}/{transcode?}', PlayController::class)`
+
+- `{transcode?}` 是可选参数，匹配 `1` 或空
+- 传入 `1` 时 `$transcode = '1'`，强制转码
+- 不传时 `$transcode = null`，由 Streamer 自动判断
+
+**类型转换**:
+```php
+// PlayController.php:25-27
+$transcodeBitRate = $transcode
+    ? (int) filter_var($user->preferences->transcodeQuality, FILTER_SANITIZE_NUMBER_INT)
+    : null;
+
+// PlayController.php:30-31
+RequestedStreamingConfig::make(
+    transcode: (bool) $transcode,  // '1' → true, null → false
+```
+
+---
+
+## 3.9 startTime 参数分析
 
 ### 参数定义与传递链路
 
@@ -571,13 +702,17 @@ return (new Streamer(song: $song, config: RequestedStreamingConfig::make(
 
 ### 未生效边界分析
 
-**参数传递链路**:
+**完整参数传递链路**:
 ```
-请求参数 ?time=123.45
+前端: getSourceUrl() → 不传递 time 参数
     ↓
-PlayController: $request->time → (float) 123.45
+HTTP 请求: GET /play/{song_id}?t={token}
     ↓
-RequestedStreamingConfig::make(startTime: 123.45)
+Laravel Request: $request->time → null
+    ↓
+PlayController: (float) null → 0.0
+    ↓
+RequestedStreamingConfig::make(startTime: 0.0)
     ↓
 Streamer 构造函数接收 config
     ↓
@@ -588,10 +723,12 @@ Streamer::stream() 传递给 adapter->stream($song, $config)
 实际播放从 0 秒开始（由浏览器/音频元素控制）
 ```
 
-**前端对应逻辑**:
-前端 `play_start_time` 字段用于 Last.fm scrobble 时间戳记录，**不用于音频 seek**。实际播放起始位置由浏览器的 `<audio>` 元素和用户交互控制。
+**前端 `play_start_time` 字段的真实用途**:
+前端 `play_start_time` 字段**不用于音频 seek**，仅用于：
+- Last.fm scrobble 时间戳记录 ([`playableStore.ts:168`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\resources\assets\js\stores\playableStore.ts#L168))
+- 播放统计时间戳 ([`QueuePlaybackService.ts:371`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\resources\assets\js\services\QueuePlaybackService.ts#L371))
 
-> **结论**: `startTime` 参数是一个**预留但未实现**的功能。请求中传递的 `time` 参数被完整封装到 `RequestedStreamingConfig` 对象中，但在所有流式输出路径中都被忽略，不影响实际播放行为。
+> **结论**: `startTime` 参数是一个**完全预留但未实现**的功能。从前端 URL 组装开始就不传递该参数，后端虽然有完整的参数封装链路，但在所有流式输出路径中都被忽略。播放起始位置完全由浏览器的 `<audio>` 元素控制，服务端不干预。
 
 ---
 
@@ -932,7 +1069,10 @@ public function stream(Song $song, ?RequestedStreamingConfig $config = null): Re
 | 云存储跳过 hash 校验 | Transcode.php:52 | 避免每次都从云存储下载验证 | 转码文件损坏后无法自动恢复 |
 | SFTP 转码本地存储 | SftpTranscodingStrategy.php:45 | 避免重复下载，加快后续播放 | 占用本地磁盘空间 |
 | SFTP 直出先下载全文件 | SftpStreamerAdapter.php:20 | `daverandom/resume` 只支持本地文件 | 首次播放延迟高，内存占用大 |
-| startTime 参数预留未实现 | RequestedStreamingConfig.php:10 | 为未来功能预留接口 | 传递链路完整但无实际效果 |
+| SongPlayRequest 无验证规则 | SongPlayRequest.php:9 | 播放请求参数简单，简化实现 | 依赖 PHP 类型转换的隐式行为 |
+| 前端不传递 time 参数 | playableStore.ts:193-197 | 服务端未实现 seek 功能 | 预留代码无实际用途 |
+| startTime 参数完整链路预留 | PlayController.php:32 | 为未来服务端 seek 预留接口 | 传递链路完整但无实际效果 |
+| transcode 路由参数无类型约束 | routes/web.base.php:48 | 简化路由定义 | 依赖 `(bool)` 强制转换的隐式行为 |
 
 ---
 
@@ -946,3 +1086,32 @@ public function stream(Song $song, ?RequestedStreamingConfig $config = null): Re
 | S3/Dropbox 转码 | 云存储 | ✅ 云存储原生 | 首次转码延迟高 | 云存储出网 | 大用户量，格式复杂 |
 | SFTP 直出 | - | ✅ 下载后本地处理 | 下载延迟高 | 服务器出网 + SFTP 流量 | 远程存储，小用户量 |
 | SFTP 转码 | 本地 | ✅ 本地处理 | 下载 + 转码延迟 | 服务器出网 + SFTP 流量 | 远程存储，格式复杂 |
+
+---
+
+## 10. 输入参数边界总结
+
+### 10.1 请求参数清单
+
+| 参数 | 位置 | 类型 | 默认值 | 验证 | 实际用途 |
+|-----|------|------|--------|------|---------|
+| `song` | 路由路径 | UUID | 必填 | 路由模型绑定 | 定位歌曲 |
+| `transcode` | 路由路径 | 布尔 | `null` | 无，依赖 `(bool)` 转换 | 强制转码开关 |
+| `t` | 查询参数 | 字符串 | 必填 | Sanctum 认证 | 音频认证 Token |
+| `time` | 查询参数 | 浮点数 | `0.0` | 无，依赖 `(float)` 转换 | **预留未使用** |
+| `api_token` | 查询参数 | 字符串 | 可选 | Sanctum 认证 | 备用 Token 传递方式 |
+
+### 10.2 类型转换隐式行为
+
+| 转换场景 | 代码位置 | 行为 |
+|---------|---------|------|
+| `(bool) $transcode` | PlayController.php:30 | `'1'` → `true`, `null` → `false`, 其他非空值也为 `true` |
+| `(float) $request->time` | PlayController.php:32 | `null` → `0.0`, 非数字字符串 → `0.0`, 负值也被接受 |
+| `(int) filter_var(..., FILTER_SANITIZE_NUMBER_INT)` | PlayController.php:27 | 从用户偏好中提取数字码率 |
+
+### 10.3 关键发现
+
+1. **`time` 参数完全未使用**：从前端 URL 组装开始就不传递，后端虽有完整封装链路但所有适配器都忽略该参数
+2. **`SongPlayRequest` 无验证**：空类仅用于类型约束，所有参数验证依赖 PHP 隐式类型转换
+3. **前端播放控制完全在浏览器端**：服务端不干预播放起始位置、进度控制等，仅提供音频数据流
+4. **转码决策双路径**：既可通过 URL 参数 `{transcode}` 强制转码，也可根据 MIME 类型自动判断
