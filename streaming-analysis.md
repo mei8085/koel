@@ -324,6 +324,275 @@ public function transcode(string $source, string $destination, int $bitRate): vo
 - `-movflags +faststart`: moov atom 前置，优化流式播放
 - `-y`: 覆盖已存在文件
 
+### 3.5 云存储转码链路 (S3/Dropbox)
+
+**文件**: `app/Services/Transcoding/CloudTranscodingStrategy.php:13-65`
+
+```php
+class CloudTranscodingStrategy extends TranscodingStrategy
+{
+    public function getTranscodeLocation(Song $song, int $bitRate): string
+    {
+        $storage = CloudStorageFactory::make($song->storage);
+
+        $transcode = $this->findTranscodeBySongAndBitRate($song, $bitRate) ?? $this->createTranscode(
+            $storage,
+            $song,
+            $bitRate,
+        );
+
+        return $storage->getPresignedUrl($transcode->location);
+    }
+
+    private function createTranscode(CloudStorage $storage, Song $song, int $bitRate): Transcode
+    {
+        $tmpDestination = artifact_path(sprintf('tmp/%s.m4a', Ulid::generate()));
+
+        // 直接使用云存储的预签名 URL 作为 FFmpeg 输入源
+        $this->transcoder->transcode(
+            $storage->getPresignedUrl($song->storage_metadata->getPath()),
+            $tmpDestination,
+            $bitRate,
+        );
+
+        $key = sprintf('transcodes/%d/%s.m4a', $bitRate, Ulid::generate());
+
+        try {
+            $storage->uploadToStorage($key, $tmpDestination);
+
+            return $this->createOrUpdateTranscode(
+                $song,
+                $key,  // 存储的是云存储的 key，不是本地路径
+                $bitRate,
+                File::hash($tmpDestination),
+                File::size($tmpDestination),
+            );
+        } finally {
+            File::delete($tmpDestination);  // 无论成功失败都删除临时文件
+        }
+    }
+}
+```
+
+**云存储转码流程图**:
+```
+云存储源文件 (S3/Dropbox)
+    │
+    ├─ 生成预签名 URL (getPresignedUrl)
+    │
+    ▼
+FFmpeg 远程拉流转码
+    │
+    ├─ 输入: 云存储预签名 URL (HTTP)
+    ├─ 输出: 本地临时文件 artifact_path/tmp/{ulid}.m4a
+    │
+    ▼
+上传转码文件回云存储
+    │
+    ├─ 目标路径: transcodes/{bitRate}/{ulid}.m4a
+    │
+    ▼
+保存转码记录到数据库
+    │
+    ├─ location 字段存储云存储 key (不是本地路径)
+    │
+    ▼
+删除本地临时文件
+    │
+    ▼
+返回云存储预签名 URL 给播放器
+```
+
+**云存储转码缓存验证** ([`Transcode.php:48-57`](d:\fz\0508-2\solo-dogfeeding\code\73-koel\app\Models\Transcode.php#L48-L57)):
+```php
+public function isValid(): bool
+{
+    // 云存储歌曲跳过本地文件 hash 校验，假设转码文件始终有效
+    if ($this->song->isStoredOnCloud()) {
+        return true;
+    }
+    return File::isReadable($this->location) && File::hash($this->location) === $this->hash;
+}
+```
+
+> **重要**: 云存储转码不验证文件 hash，只要数据库记录存在就认为有效。这意味着如果云存储上的转码文件被删除或损坏，播放会失败但不会自动重新转码。
+
+### 3.6 SFTP 转码链路
+
+**文件**: `app/Services/Transcoding/SftpTranscodingStrategy.php:11-54`
+
+```php
+class SftpTranscodingStrategy extends TranscodingStrategy
+{
+    public function getTranscodeLocation(Song $song, int $bitRate): string
+    {
+        $transcode = $this->findTranscodeBySongAndBitRate($song, $bitRate);
+
+        if ($transcode?->isValid()) {
+            return $transcode->location;
+        }
+
+        if ($transcode) {
+            File::delete($transcode->location);
+        }
+
+        /** @var SftpStorage $storage */
+        $storage = app(SftpStorage::class);
+        
+        // 先将源文件从 SFTP 复制到本地临时文件
+        $tmpSource = $storage->copyToLocal($song->storage_metadata->getPath());
+
+        // 本地转码
+        $destination = artifact_path(sprintf('transcodes/%d/%s.m4a', $bitRate, Ulid::generate()));
+        $this->transcoder->transcode($tmpSource, $destination, $bitRate);
+
+        $this->createOrUpdateTranscode(
+            $song,
+            $destination,  // 存储本地路径
+            $bitRate,
+            File::hash($destination),
+            File::size($destination),
+        );
+
+        File::delete($tmpSource);  // 删除源文件临时副本
+
+        return $destination;
+    }
+}
+```
+
+**SFTP 转码流程图**:
+```
+SFTP 远程源文件
+    │
+    ▼
+copyToLocal() 下载到本地临时文件
+    │
+    ▼
+FFmpeg 本地转码
+    │
+    ├─ 输入: 本地临时文件
+    ├─ 输出: artifact_path/transcodes/{bitRate}/{ulid}.m4a
+    │
+    ▼
+保存转码记录 (location = 本地路径)
+    │
+    ▼
+删除源文件临时副本
+    │
+    ▼
+返回本地转码文件路径 → streamLocalPath() 流式输出
+```
+
+> **关键差异**: SFTP 转码后的文件存储在**本地**，不回传到 SFTP 服务器。转码缓存采用本地 hash 校验机制。
+
+### 3.7 云存储与 SFTP 直出链路
+
+#### S3/Dropbox 直出
+
+**文件**: `app/Services/Streamer/Adapters/S3CompatibleStreamerAdapter.php:11-22`
+```php
+public function stream(Song $song, ?RequestedStreamingConfig $config = null): Redirector|RedirectResponse
+{
+    $this->storage->assertSupported();
+    return redirect($this->storage->getPresignedUrl($song->storage_metadata->getPath()));
+}
+```
+
+- **行为**: 302 重定向到云存储预签名 URL
+- **Range 支持**: 由云存储提供商处理（S3 原生支持）
+- **Koel 感知**: 重定向后 Koel 完全不参与传输
+
+#### SFTP 直出
+
+**文件**: `app/Services/Streamer/Adapters/SftpStreamerAdapter.php:10-21`
+```php
+class SftpStreamerAdapter implements StreamerAdapter
+{
+    use StreamsLocalPath;
+
+    public function stream(Song $song, ?RequestedStreamingConfig $config = null): void
+    {
+        $this->streamLocalPath($this->storage->copyToLocal($song->storage_metadata->getPath()));
+    }
+}
+```
+
+- **行为**: 先完整下载到本地临时文件，再通过 `streamLocalPath()` 流式输出
+- **Range 支持**: 下载完成后由本地 `StreamsLocalPath` 处理
+- **代价**: 首次播放有下载延迟，占用临时磁盘空间
+
+---
+
+## 3.8 startTime 参数分析
+
+### 参数定义与传递链路
+
+**定义**: `app/Values/RequestedStreamingConfig.php:5-16`
+```php
+final readonly class RequestedStreamingConfig
+{
+    private function __construct(
+        public bool $transcode,
+        public ?int $bitRate,
+        public float $startTime,  // 参数定义
+    ) {}
+
+    public static function make(bool $transcode = false, ?int $bitRate = 128, float $startTime = 0.0): self
+    {
+        return new self($transcode, $bitRate, $startTime);
+    }
+}
+```
+
+**传递**: `app/Http/Controllers/PlayController.php:80-84`
+```php
+return (new Streamer(song: $song, config: RequestedStreamingConfig::make(
+    transcode: (bool) $transcode,
+    bitRate: $transcodeBitRate,
+    startTime: (float) $request->time,  // 从请求参数读取
+)))->stream();
+```
+
+### 真实生效范围核查
+
+通过全代码库搜索，**`startTime` 参数在所有 StreamerAdapter 实现中完全未被使用**：
+
+| 适配器 | 是否使用 startTime | 代码位置 |
+|-------|-------------------|---------|
+| `PhpStreamerAdapter` | ❌ 未使用 | `PhpStreamerAdapter.php:13-20` |
+| `XSendFileStreamerAdapter` | ❌ 未使用 | `XSendFileStreamerAdapter.php:13-24` |
+| `XAccelRedirectStreamerAdapter` | ❌ 未使用 | `XAccelRedirectStreamerAdapter.php:15-31` |
+| `TranscodingStreamerAdapter` | ❌ 未使用 | `TranscodingStreamerAdapter.php:16-33` |
+| `S3CompatibleStreamerAdapter` | ❌ 未使用 | `S3CompatibleStreamerAdapter.php:17-22` |
+| `DropboxStreamerAdapter` | ❌ 未使用 | `DropboxStreamerAdapter.php:17-22` |
+| `SftpStreamerAdapter` | ❌ 未使用 | `SftpStreamerAdapter.php:18-21` |
+| `PodcastStreamerAdapter` | ❌ 未使用 | `PodcastStreamerAdapter.php:21-32` |
+
+### 未生效边界分析
+
+**参数传递链路**:
+```
+请求参数 ?time=123.45
+    ↓
+PlayController: $request->time → (float) 123.45
+    ↓
+RequestedStreamingConfig::make(startTime: 123.45)
+    ↓
+Streamer 构造函数接收 config
+    ↓
+Streamer::stream() 传递给 adapter->stream($song, $config)
+    ↓
+所有适配器接收 $config 参数但忽略 $config->startTime
+    ↓
+实际播放从 0 秒开始（由浏览器/音频元素控制）
+```
+
+**前端对应逻辑**:
+前端 `play_start_time` 字段用于 Last.fm scrobble 时间戳记录，**不用于音频 seek**。实际播放起始位置由浏览器的 `<audio>` 元素和用户交互控制。
+
+> **结论**: `startTime` 参数是一个**预留但未实现**的功能。请求中传递的 `time` 参数被完整封装到 `RequestedStreamingConfig` 对象中，但在所有流式输出路径中都被忽略，不影响实际播放行为。
+
 ---
 
 ## 4. Range Request 处理实现
@@ -595,6 +864,59 @@ public function stream(Song $song, ?RequestedStreamingConfig $config = null): Re
 8. 浏览器直接从 S3 下载播放
 ```
 
+### 7.4 云存储转码路径 (S3 FLAC)
+
+```
+1. routes/web.base.php:48 → GET play/{song}
+2. app/Http/Middleware/AudioAuthenticate.php:13 → tokenCan('audio')
+3. app/Http/Controllers/PlayController.php:20 → authorize('access', $song)
+4. app/Policies/SongPolicy.php:14 → License::isCommunity() || accessibleBy()
+5. app/Services/Streamer/Streamer.php:35 → shouldTranscode() = true (FLAC)
+6. app/Services/Streamer/Adapters/TranscodingStreamerAdapter.php:16 → stream()
+7. app/Services/Transcoding/TranscodeStrategyFactory.php:14 → CloudTranscodingStrategy
+8. app/Services/Transcoding/CloudTranscodingStrategy.php:19 → 查找缓存
+9. app/Services/Transcoding/CloudTranscodingStrategy.php:35 → createTranscode()
+10. app/Services/SongStorages/S3CompatibleStorage.php:40 → getPresignedUrl(源文件)
+11. app/Services/Transcoding/Transcoder.php:27 → FFmpeg 远程拉流转码
+12. app/Services/SongStorages/S3CompatibleStorage.php:55 → uploadToStorage(转码文件)
+13. app/Services/Transcoding/CloudTranscodingStrategy.php:50 → 保存转码记录
+14. app/Services/Transcoding/CloudTranscodingStrategy.php:25 → getPresignedUrl(转码文件)
+15. Laravel redirect() → 302 Found 到 S3 转码文件 URL
+16. 浏览器直接从 S3 下载播放
+```
+
+### 7.5 SFTP 转码路径
+
+```
+1. routes/web.base.php:48 → GET play/{song}
+2. app/Http/Middleware/AudioAuthenticate.php:13 → tokenCan('audio')
+3. app/Http/Controllers/PlayController.php:20 → authorize('access', $song)
+4. app/Policies/SongPolicy.php:14 → License::isCommunity() || accessibleBy()
+5. app/Services/Streamer/Streamer.php:35 → shouldTranscode() = true
+6. app/Services/Streamer/Adapters/TranscodingStreamerAdapter.php:16 → stream()
+7. app/Services/Transcoding/TranscodeStrategyFactory.php:18 → SftpTranscodingStrategy
+8. app/Services/Transcoding/SftpTranscodingStrategy.php:15 → 查找缓存
+9. app/Services/Transcoding/SftpTranscodingStrategy.php:28 → copyToLocal() 下载源文件
+10. app/Services/Transcoding/Transcoder.php:27 → FFmpeg 本地转码
+11. app/Services/Transcoding/SftpTranscodingStrategy.php:35 → 保存转码记录
+12. app/Services/Streamer/Adapters/TranscodingStreamerAdapter.php:32 → streamLocalPath()
+13. app/Services/Streamer/Adapters/Concerns/StreamsLocalPath.php:28 → RangeSet::createFromHeader()
+14. daverandom/resume → 发送 206 Partial Content
+```
+
+### 7.6 SFTP 直出路径
+
+```
+1. routes/web.base.php:48 → GET play/{song}
+2. app/Http/Middleware/AudioAuthenticate.php:13 → tokenCan('audio')
+3. app/Http/Controllers/PlayController.php:20 → authorize('access', $song)
+4. app/Policies/SongPolicy.php:14 → License::isCommunity() || accessibleBy()
+5. app/Services/Streamer/Streamer.php:43 → SftpStreamerAdapter
+6. app/Services/Streamer/Adapters/SftpStreamerAdapter.php:20 → copyToLocal() 完整下载
+7. app/Services/Streamer/Adapters/Concerns/StreamsLocalPath.php:28 → RangeSet::createFromHeader()
+8. daverandom/resume → 发送 206 Partial Content
+```
+
 ---
 
 ## 8. 关键设计决策总结
@@ -606,3 +928,21 @@ public function stream(Song $song, ?RequestedStreamingConfig $config = null): Re
 | Safari Range 头转换 | StreamsLocalPath.php:26 | 兼容 Safari 的探测请求 | 与标准略有差异 |
 | 转码文件永久缓存 | LocalTranscodingStrategy.php:16 | 节省 CPU，提升体验 | 占用磁盘空间 |
 | FLAC 默认转码 | config/koel.php:44 | 浏览器对 FLAC 支持不一致 | 损失音质，增加延迟 |
+| 云存储转码回传 | CloudTranscodingStrategy.php:48 | 利用云存储 CDN 分发 | 额外云存储费用和上传流量 |
+| 云存储跳过 hash 校验 | Transcode.php:52 | 避免每次都从云存储下载验证 | 转码文件损坏后无法自动恢复 |
+| SFTP 转码本地存储 | SftpTranscodingStrategy.php:45 | 避免重复下载，加快后续播放 | 占用本地磁盘空间 |
+| SFTP 直出先下载全文件 | SftpStreamerAdapter.php:20 | `daverandom/resume` 只支持本地文件 | 首次播放延迟高，内存占用大 |
+| startTime 参数预留未实现 | RequestedStreamingConfig.php:10 | 为未来功能预留接口 | 传递链路完整但无实际效果 |
+
+---
+
+## 9. 各存储场景对比
+
+| 场景 | 转码缓存位置 | Range 支持 | 首次播放延迟 | 带宽消耗 | 适用场景 |
+|-----|------------|-----------|-------------|---------|---------|
+| 本地存储直出 | - | ✅ 原生 | 低 | 服务器出网 | 小用户量，服务器磁盘充足 |
+| 本地存储转码 | 本地 | ✅ 原生 | 首次转码延迟高 | 服务器出网 | 格式复杂，需要转码 |
+| S3/Dropbox 直出 | - | ✅ 云存储原生 | 低 | 云存储出网 | 大用户量，CDN 分发 |
+| S3/Dropbox 转码 | 云存储 | ✅ 云存储原生 | 首次转码延迟高 | 云存储出网 | 大用户量，格式复杂 |
+| SFTP 直出 | - | ✅ 下载后本地处理 | 下载延迟高 | 服务器出网 + SFTP 流量 | 远程存储，小用户量 |
+| SFTP 转码 | 本地 | ✅ 本地处理 | 下载 + 转码延迟 | 服务器出网 + SFTP 流量 | 远程存储，格式复杂 |
