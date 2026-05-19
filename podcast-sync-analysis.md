@@ -4,6 +4,7 @@
 - **分析对象**: Koel 播客订阅同步功能
 - **代码版本**: 当前工作目录
 - **分析日期**: 2026-05-20
+- **文档版本**: v1.1（补充调度队列链路、异常隔离界限、GUID 唯一性风险分析）
 - **文档目的**: 详细阐述播客订阅同步的完整实现链路，为代码复核提供依据
 
 ---
@@ -13,9 +14,12 @@
 2. [订阅源解析流程](#2-订阅源解析流程)
 3. [剧集去重策略](#3-剧集去重策略)
 4. [定期更新任务链路](#4-定期更新任务链路)
-5. [异常处理机制](#5-异常处理机制)
-6. [性能优化设计](#6-性能优化设计)
-7. [总结与建议](#7-总结与建议)
+5. [调度任务到队列执行的完整触发过程](#5-调度任务到队列执行的完整触发过程)
+6. [异常处理机制](#6-异常处理机制)
+7. [剧集级与播客级异常隔离的具体界限](#7-剧集级与播客级异常隔离的具体界限)
+8. [跨播客GUID全局唯一性约束的风险分析](#8-跨播客guid全局唯一性约束的风险分析)
+9. [性能优化设计](#9-性能优化设计)
+10. [总结与建议](#10-总结与建议)
 
 ---
 
@@ -524,9 +528,173 @@ public function refreshPodcast(Podcast $podcast): Podcast
 
 ---
 
-## 5. 异常处理机制
+## 5. 调度任务到队列执行的完整触发过程
 
-### 5.1 订阅源失效处理
+### 5.1 任务调度注册
+
+**调度定义**: [routes/console.php:1-11](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/routes/console.php#L1-L11)
+
+```php
+use App\Jobs\RunCommandJob;
+use Illuminate\Support\Facades\Schedule;
+
+Schedule::job(new RunCommandJob('koel:podcasts:sync'))->daily();
+```
+
+> **代码事实**: 
+> 1. 使用 Laravel 的 `Schedule` 门面注册定时任务
+> 2. 任务被包装在 `RunCommandJob` 中，该 Job 继承自 `QueuedJob`
+> 3. `daily()` 方法指定任务每天执行一次（默认午夜 00:00）
+
+### 5.2 队列 Job 类结构
+
+**QueuedJob 抽象基类**: [app/Jobs/QueuedJob.php](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Jobs/QueuedJob.php)
+
+```php
+abstract class QueuedJob implements ShouldQueue
+{
+    use Dispatchable;
+    use InteractsWithQueue;
+    use Queueable;
+    use SerializesModels;
+}
+```
+
+> **代码事实**: 
+> 1. 实现了 `ShouldQueue` 接口，表明该 Job 应被推送到队列而非同步执行
+> 2. 使用了 Laravel 队列的标准 Trait 组合：`Dispatchable`（可分发）、`InteractsWithQueue`（与队列交互）、`Queueable`（队列配置）、`SerializesModels`（模型序列化）
+
+**RunCommandJob 具体实现**: [app/Jobs/RunCommandJob.php](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Jobs/RunCommandJob.php)
+
+```php
+class RunCommandJob extends QueuedJob
+{
+    public function __construct(
+        public readonly string $command,
+    ) {}
+
+    public function handle(): void
+    {
+        Artisan::call($this->command);
+    }
+}
+```
+
+> **代码事实**: 
+> 1. 接收一个命令字符串作为构造参数（如 `'koel:podcasts:sync'`）
+> 2. `handle()` 方法通过 `Artisan::call()` 执行该命令
+> 3. 这是一个通用的命令执行 Job，不仅用于播客同步
+
+### 5.3 完整触发链路
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  触发源: Laravel 任务调度器 (Scheduler)                      │
+│  - 由 cron 每分钟调用 php artisan schedule:run              │
+│  - 检查 routes/console.php 中定义的调度任务                  │
+│  - 匹配到 daily() 任务且到达执行时间点                       │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────┐
+│  步骤1: 创建 Job 实例                                        │
+│  new RunCommandJob('koel:podcasts:sync')                    │
+│  继承自 QueuedJob，实现了 ShouldQueue 接口                   │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────┐
+│  步骤2: 分发到队列                                           │
+│  Schedule::job() 内部调用 dispatch() 方法                    │
+│  根据 config/queue.php 配置决定队列连接                      │
+│  默认配置: QUEUE_CONNECTION=database                         │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────┐
+│  步骤3: 队列存储 (database 驱动)                             │
+│  序列化 Job 对象写入 jobs 表                                │
+│  字段: queue, payload, attempts, available_at, created_at   │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────┐
+│  步骤4: 队列 Worker 消费                                     │
+│  php artisan queue:work 进程轮询 jobs 表                    │
+│  获取可用 Job，反序列化 payload                              │
+│  调用 Job::handle() 方法                                    │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────┐
+│  步骤5: 执行 Artisan 命令                                    │
+│  RunCommandJob::handle() 调用 Artisan::call($command)       │
+│  执行: koel:podcasts:sync                                   │
+└──────────────────────────────┬──────────────────────────────┘
+                               ↓
+┌─────────────────────────────────────────────────────────────┐
+│  步骤6: 同步命令执行                                         │
+│  SyncPodcastsCommand::handle() 被调用                       │
+│  根据 --jobs 参数决定串行/并行执行                           │
+│  调用 PodcastService::refreshPodcast() 同步每个播客         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.4 队列配置
+
+**队列默认配置**: [config/queue.php:15](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/config/queue.php#L15-L15)
+
+```php
+'default' => env('QUEUE_CONNECTION', 'database'),
+```
+
+> **代码事实**: 
+> 1. 默认使用 `database` 队列驱动，作业存储在数据库的 `jobs` 表中
+> 2. 可通过 `.env` 的 `QUEUE_CONNECTION` 变量修改为 redis、sqs 等其他驱动
+> 3. database 驱动无需额外服务，适合中小型部署
+
+### 5.5 与事件系统的联动
+
+除了调度任务，播客模块还通过事件系统实现自动化操作：
+
+**事件订阅配置**: [app/Providers/EventServiceProvider.php:57-59](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Providers/EventServiceProvider.php#L57-L59)
+
+```php
+UserUnsubscribedFromPodcast::class => [
+    DeletePodcastIfNoSubscribers::class,
+],
+```
+
+**事件触发**: [app/Services/Podcast/PodcastService.php:206-210](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Services/Podcast/PodcastService.php#L206-L210)
+
+```php
+public function unsubscribeUserFromPodcast(User $user, Podcast $podcast): void
+{
+    $user->podcasts()->detach($podcast);
+    event(new UserUnsubscribedFromPodcast($user, $podcast));
+}
+```
+
+**监听器实现**: [app/Listeners/DeletePodcastIfNoSubscribers.php:9-21](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Listeners/DeletePodcastIfNoSubscribers.php#L9-L21)
+
+```php
+readonly class DeletePodcastIfNoSubscribers implements ShouldQueue
+{
+    public function handle(UserUnsubscribedFromPodcast $event): void
+    {
+        if ($event->podcast->subscribers()->count() === 0) {
+            $this->podcastService->deletePodcast($event->podcast);
+        }
+    }
+}
+```
+
+> **代码事实**: 
+> 1. 用户取消订阅时触发 `UserUnsubscribedFromPodcast` 事件
+> 2. 监听器 `DeletePodcastIfNoSubscribers` 实现了 `ShouldQueue`，异步执行
+> 3. 检查播客是否还有其他订阅者，没有则删除播客及其所有剧集
+> 4. 这是一种垃圾回收机制，避免无人订阅的播客占用资源
+
+---
+
+## 6. 异常处理机制
+
+### 6.1 订阅源失效处理
 
 | 失效场景 | 处理策略 | 代码位置 |
 |---------|---------|---------|
@@ -536,7 +704,7 @@ public function refreshPodcast(Podcast $podcast): Podcast
 | 并行子进程崩溃 | 检查退出码，报告错误，不影响其他进程 | [ParallelPodcastSync.php:108-116](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Services/Podcast/ParallelPodcastSync.php#L108-L116) |
 | 分块命令单个失败 | 捕获异常，记录日志，输出 error 状态 | [SyncPodcastsChunkCommand.php:36-38](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Console/Commands/SyncPodcastsChunkCommand.php#L36-L38) |
 
-### 5.2 内容异常处理
+### 6.2 内容异常处理
 
 | 异常场景 | 处理策略 | 代码位置 |
 |---------|---------|---------|
@@ -557,7 +725,7 @@ private static function parseFeedDate(?string $date): ?Carbon
 ```
 > **代码事实**: 使用 `rescue()` 辅助函数，解析失败时静默返回 `null`，避免中断流程。
 
-### 5.3 异常类定义
+### 6.3 异常类定义
 
 **FailedToParsePodcastFeedException**: [app/Exceptions/FailedToParsePodcastFeedException.php](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Exceptions/FailedToParsePodcastFeedException.php)
 
@@ -572,7 +740,7 @@ final class FailedToParsePodcastFeedException extends RuntimeException
 ```
 > **代码事实**: 专用异常类，封装解析失败场景，保留原始异常堆栈。
 
-### 5.4 错误隔离层级
+### 6.4 错误隔离层级
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -597,9 +765,335 @@ final class FailedToParsePodcastFeedException extends RuntimeException
 
 ---
 
-## 6. 性能优化设计
+## 7. 剧集级与播客级异常隔离的具体界限
 
-### 6.1 批量插入优化
+### 7.1 隔离层级定义
+
+播客同步系统设计了三层异常隔离机制，确保不同粒度的故障不会扩散影响整体系统稳定性。
+
+| 隔离层级 | 影响范围 | 处理策略 | 关键代码位置 |
+|---------|---------|---------|-------------|
+| **进程级** | 单个并行子进程 | 子进程崩溃不影响主进程和其他子进程 | [ParallelPodcastSync.php:108-116](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Services/Podcast/ParallelPodcastSync.php#L108-L116) |
+| **播客级** | 单个播客的同步 | 单个播客失败不影响其他播客的同步 | [SyncPodcastsCommand.php:56-58](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Console/Commands/SyncPodcastsCommand.php#L56-L58) |
+| **剧集级** | 单个剧集的处理 | 单集异常跳过，不影响同播客其他剧集 | [PodcastService.php:142-149](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Services/Podcast/PodcastService.php#L142-L149) |
+
+### 7.2 剧集级异常隔离
+
+**代码位置**: [PodcastService.php:128-177](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Services/Podcast/PodcastService.php#L128-L177)
+
+**可在剧集级处理并跳过的异常场景**：
+
+```php
+foreach ($episodeCollection as $episodeValue) {
+    // 场景1: GUID 已存在 → 跳过
+    if (in_array($episodeValue->guid->value, $existingEpisodeGuids, true)) {
+        continue;
+    }
+
+    // 场景2: 音频 URL 不安全 → 记录警告并跳过
+    $enclosureUrl = (string) $episodeValue->enclosure->url;
+    if (!Network::isSafeUrl($enclosureUrl)) {
+        Log::warning(sprintf(
+            'Skipping podcast episode "%s" with unsafe enclosure URL: %s',
+            $episodeValue->title,
+            $enclosureUrl,
+        ));
+        continue;
+    }
+
+    // 场景3: 元数据缺失 → 使用默认值填充
+    $records[] = [
+        'created_at' => $episodeValue->metadata->pubDate ?: now(),
+        'length' => $episodeValue->metadata->duration ?? 0,
+        // ...
+    ];
+}
+```
+
+> **代码事实**: 
+> 1. 剧集级异常在 `synchronizeEpisodes()` 方法内部处理
+> 2. 单集问题不会中断循环，后续剧集继续处理
+> 3. 仅记录警告日志，不抛出异常
+> 4. 适用于：URL 不安全、GUID 重复、元数据缺失等可恢复问题
+
+### 7.3 播客级异常隔离
+
+**代码位置**: [SyncPodcastsCommand.php:42-62](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Console/Commands/SyncPodcastsCommand.php#L42-L62) 和 [SyncPodcastsChunkCommand.php:23-43](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Console/Commands/SyncPodcastsChunkCommand.php#L23-L43)
+
+**会触发播客级异常的场景**：
+
+```php
+// 在 SyncPodcastsCommand 中
+Podcast::query()->get()->each(function (Podcast $podcast): void {
+    try {
+        if (!$this->podcastService->isPodcastObsolete($podcast)) {
+            return;
+        }
+        $this->podcastService->refreshPodcast($podcast);
+    } catch (Throwable $e) {
+        // 播客级异常捕获点
+        Log::error($e);
+        // 不抛出，继续处理下一个播客
+    }
+});
+```
+
+> **代码事实**: 
+> 1. 播客级异常在命令层（Command）捕获
+> 2. 单个播客的整个同步过程（过时检查 + 刷新）被 try-catch 包裹
+> 3. 异常被记录但不向上抛出，确保其他播客继续同步
+> 4. 适用于：网络连接失败、RSS 解析失败、数据库事务失败等
+
+**播客级异常包含的具体失败场景**：
+- `isPodcastObsolete()` 中的 HEAD 请求失败（但该方法内部已捕获，不会到达此处）
+- `refreshPodcast()` 中的 Poddle 解析器创建失败
+- `refreshPodcast()` 中的 XML 解析错误
+- `synchronizeEpisodes()` 中的数据库批量插入失败
+- 任何其他未在服务层捕获的 Throwable
+
+### 7.4 隔离界限的关键代码证据
+
+**重要界限1: `synchronizeEpisodes()` 方法没有外层 try-catch**
+
+```php
+private function synchronizeEpisodes(Podcast $podcast, EpisodeCollection $episodeCollection): void
+{
+    // ... 循环内处理单集异常 ...
+    
+    // ⚠️  这里没有 try-catch 包裹
+    Episode::query()->insert($records);
+    Episode::query()->whereIn('id', $ids)->searchable();
+}
+```
+
+> **代码事实**: 如果批量插入操作失败（如数据库连接断开、唯一约束冲突等），异常会**向上抛出**到 `refreshPodcast()`，最终在命令层被捕获，导致**整个播客**的同步失败，即使只有一条记录有问题。
+
+**重要界限2: `refreshPodcast()` 方法没有外层 try-catch**
+
+```php
+public function refreshPodcast(Podcast $podcast): Podcast
+{
+    // ⚠️  这里没有 try-catch 包裹
+    $parser = $this->createParser($podcast->url);
+    $channel = $parser->getChannel();
+    
+    // ... 日期检查 ...
+    
+    $this->synchronizeEpisodes($podcast, $parser->getEpisodes(true));
+    
+    $podcast->update([...]);
+    
+    return $podcast->refresh();
+}
+```
+
+> **代码事实**: 解析失败、日期解析失败、剧集同步失败、播客元数据更新失败，都会导致整个 `refreshPodcast()` 调用失败，该播客本次同步不会更新 `last_synced_at`，下次任务会重试。
+
+### 7.5 异常传播路径图
+
+```
+剧集级异常（可恢复）
+    ↓
+    ├─ GUID 重复 → continue → 继续下一集
+    ├─ URL 不安全 → Log::warning + continue → 继续下一集
+    └─ 元数据缺失 → 使用默认值 → 正常插入
+        ↓
+        成功，无异常传播
+
+播客级异常（不可恢复）
+    ↓
+    ├─ Poddle 解析失败 → 抛出异常
+    ├─ 数据库插入失败 → 抛出异常
+    ├─ 播客 update() 失败 → 抛出异常
+    └─ 其他 Throwable → 向上传播
+        ↓
+        被命令层 catch → Log::error → 继续下一个播客
+```
+
+### 7.6 隔离机制的设计权衡
+
+**优点**:
+1. **最大化可用性**: 单个播客/剧集问题不会导致整体同步任务失败
+2. **故障隔离**: 问题被限制在最小影响范围内
+3. **可观测性**: 所有异常都有日志记录，便于排查
+
+**潜在风险**:
+1. **批量插入的原子性**: `insert($records)` 是原子操作，单条记录失败会导致整批失败。如果一批中有 100 条新剧集，其中 1 条有问题，其他 99 条也无法插入。
+2. **静默失败**: 剧集级跳过仅记录警告，如果没有监控告警可能被忽略。
+3. **无重试机制**: 播客级失败后只能等待下一次定时任务（最长 24 小时）。
+
+---
+
+## 8. 跨播客 GUID 全局唯一性约束的风险分析
+
+### 8.1 约束定义
+
+**数据库迁移**: [database/migrations/2024_05_08_094243_create_podcast_related_tables.php:37](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/database/migrations/2024_05_08_094243_create_podcast_related_tables.php#L37-L37)
+
+```php
+$table->string('episode_guid')->nullable()->unique();
+```
+
+> **代码事实**: `episode_guid` 字段在数据库层面设置了**全局唯一约束**，这意味着**不同播客的剧集也不能有相同的 GUID**。
+
+### 8.2 应用层去重逻辑的局限性
+
+**应用层去重代码**: [PodcastService.php:130-138](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Services/Podcast/PodcastService.php#L130-L138)
+
+```php
+$existingEpisodeGuids = $this->songRepository->getEpisodeGuidsByPodcast($podcast);
+
+foreach ($episodeCollection as $episodeValue) {
+    // ❗  只检查了当前播客的现有 GUID，没有检查全局
+    if (in_array($episodeValue->guid->value, $existingEpisodeGuids, true)) {
+        continue;
+    }
+    // ...
+}
+```
+
+**Repository 实现**: [SongRepository.php:351-354](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Repositories/SongRepository.php#L351-L354)
+
+```php
+public function getEpisodeGuidsByPodcast(Podcast $podcast): array
+{
+    // ❗  只查询了当前播客的剧集 GUID
+    return $podcast->episodes()->pluck('episode_guid')->toArray();
+}
+```
+
+> **代码事实**: 应用层去重仅检查**当前播客**范围内的 GUID 重复，没有检查全局范围。这与数据库的全局唯一约束不匹配。
+
+### 8.3 失败路径分析
+
+#### 场景1: 不同播客间 GUID 冲突（最可能发生）
+
+**触发条件**:
+- 播客 A 有剧集 X，GUID = "abc123"
+- 播客 B 的 feed 中也有一个剧集 GUID = "abc123"
+- （可能原因：feed 发布者配置错误、复制粘贴错误、GUID 生成算法冲突等）
+
+**失败流程**:
+```
+1. 同步播客 B
+2. 应用层检查播客 B 的现有 GUID，"abc123" 不在其中
+3. 准备批量插入，包含 "abc123"
+4. 执行 Episode::query()->insert($records)
+5. 数据库抛出 Integrity constraint violation: 1062 Duplicate entry 'abc123' for key 'songs_episode_guid_unique'
+6. 异常向上传播，播客 B 的整个同步失败
+7. 播客 B 的 last_synced_at 未更新，下次任务重试时重复此流程
+```
+
+**影响**:
+- 播客 B 永远无法同步新内容
+- 播客 B 的其他新剧集（即使 GUID 不冲突）也无法插入
+- 错误日志中会看到数据库唯一约束冲突
+- 用户感知：播客 B 的剧集列表不再更新
+
+#### 场景2: GUID 为 null 的边缘情况
+
+**代码事实**: 迁移文件中 `episode_guid` 是 `nullable()` 的
+
+```php
+$table->string('episode_guid')->nullable()->unique();
+```
+
+**潜在问题**:
+- 如果某些 feed 中的剧集没有 GUID，`$episodeValue->guid` 可能为 null
+- 数据库中 `NULL` 值不违反 UNIQUE 约束（多条 NULL 是允许的）
+- 但应用层代码 `in_array(null, $existingEpisodeGuids, true)` 可能产生意外行为
+- 需要确认 Poddle 库如何处理无 GUID 的剧集
+
+#### 场景3: 高并发下的竞态条件
+
+**触发条件**:
+- 两个并行 worker 同时处理两个不同播客
+- 两个播客的 feed 中恰好有相同的 GUID
+- 应用层检查都通过（因为检查的是各自播客的 GUID）
+- 两个 worker 几乎同时执行 insert
+
+**失败流程**:
+```
+Worker A (处理播客 X)        Worker B (处理播客 Y)
+    │                            │
+    ├─ 检查 GUID "xyz" 不在 X 中  ├─ 检查 GUID "xyz" 不在 Y 中
+    │                            │
+    ├─ 准备插入包含 "xyz" 的记录   ├─ 准备插入包含 "xyz" 的记录
+    │                            │
+    ├─ 执行 insert() 成功         ├─ 执行 insert() 失败（唯一约束冲突）
+    │                            │
+    └─ 播客 X 同步成功            └─ 播客 Y 同步失败
+```
+
+**影响**: 播客 Y 同步失败，下次重试时会再次失败，形成永久性失败。
+
+### 8.4 问题的根本原因
+
+**设计意图 vs 实际实现的差距**:
+
+| 设计意图（RSS 规范） | 实际实现（数据库约束） |
+|-------------------|---------------------|
+| GUID 在**播客内**唯一 | GUID 在**全局**唯一 |
+| 两个不同播客理论上可以有相同的 GUID（虽然不推荐） | 数据库层面严格禁止跨播客 GUID 重复 |
+
+**为什么这是一个问题**:
+1. RSS 规范中 GUID 是"全局唯一标识符"，但这是**推荐**而非**强制**
+2. 现实中存在大量不规范的 feed，可能重复使用 GUID
+3. 某些发布者可能在多个 feed 中使用相同的 GUID 来标识同一内容
+4. 应用层没有做全局检查，导致数据库约束成为"隐形陷阱"
+
+### 8.5 受影响的代码范围
+
+1. **PodcastService::synchronizeEpisodes()** - 批量插入可能失败
+2. **PodcastService::addPodcast()** - 首次添加播客时就可能失败
+3. **PodcastService::refreshPodcast()** - 同步时可能失败
+4. **所有调用上述方法的命令** - 同步命令会标记该播客为 error 状态
+
+### 8.6 修复建议
+
+**方案1: 改为复合唯一约束（推荐）**
+
+修改迁移，将唯一约束改为 `(podcast_id, episode_guid)` 的复合唯一索引：
+
+```php
+// 移除旧的全局唯一约束
+$table->dropUnique(['episode_guid']);
+
+// 添加复合唯一约束（播客内唯一）
+$table->unique(['podcast_id', 'episode_guid']);
+```
+
+**方案2: 应用层增加全局检查**
+
+在 `synchronizeEpisodes()` 中增加全局 GUID 存在性检查：
+
+```php
+// 检查全局 GUID 存在性
+$conflictingGuids = Episode::query()
+    ->whereIn('episode_guid', $newGuids)
+    ->where('podcast_id', '!=', $podcast->id)
+    ->pluck('episode_guid')
+    ->toArray();
+
+// 过滤掉冲突的 GUID
+foreach ($episodeCollection as $episodeValue) {
+    if (in_array($episodeValue->guid->value, $conflictingGuids, true)) {
+        Log::warning(sprintf('GUID %s conflicts with another podcast', $episodeValue->guid->value));
+        continue;
+    }
+    // ...
+}
+```
+
+**方案3: 组合方案**
+
+同时采用方案1（数据库复合约束）和方案2（应用层预先检查），提供双重保障。
+
+---
+
+## 9. 性能优化设计
+
+### 9.1 批量插入优化
 
 **代码位置**: [PodcastService.php:170-172](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Services/Podcast/PodcastService.php#L170-L172)
 
@@ -609,7 +1103,7 @@ Episode::query()->insert($records);
 ```
 > **代码事实**: 使用 `insert()` 而非 `createMany()`，单次查询插入所有新剧集，显著提升性能。
 
-### 6.2 手动更新搜索索引
+### 9.2 手动更新搜索索引
 
 **代码位置**: [PodcastService.php:174-176](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Services/Podcast/PodcastService.php#L174-L176)
 
@@ -619,14 +1113,14 @@ Episode::query()->whereIn('id', $ids)->searchable();
 ```
 > **代码事实**: 批量插入不触发 Eloquent 模型事件，需要手动触发 Laravel Scout 的索引更新。
 
-### 6.3 预加载现有 GUID
+### 9.3 预加载现有 GUID
 
 ```php
 $existingEpisodeGuids = $this->songRepository->getEpisodeGuidsByPodcast($podcast);
 ```
 > **代码事实**: 一次性加载所有现有 GUID 到内存，避免循环内查询数据库。
 
-### 6.4 12小时缓存窗口
+### 9.4 12小时缓存窗口
 
 ```php
 if (abs($podcast->last_synced_at->diffInHours(now())) < 12) {
@@ -635,15 +1129,15 @@ if (abs($podcast->last_synced_at->diffInHours(now())) < 12) {
 ```
 > **代码事实**: 最近12小时内同步过的播客直接跳过，减少不必要的 HTTP 请求。
 
-### 6.5 并行处理
+### 9.5 并行处理
 
 通过多进程并行同步，充分利用多核 CPU 资源，大幅缩短大量播客的同步时间。默认 4 个 worker，可根据服务器资源调整。
 
 ---
 
-## 7. 总结与建议
+## 10. 总结与建议
 
-### 7.1 实现亮点
+### 10.1 实现亮点
 
 ✅ **标准合规**: 基于 RSS 规范，使用 `episode_guid` 作为唯一标识，兼容性好  
 ✅ **双重去重**: 应用层过滤 + 数据库 UNIQUE 约束，确保数据一致性  
@@ -652,7 +1146,7 @@ if (abs($podcast->last_synced_at->diffInHours(now())) < 12) {
 ✅ **性能优化**: 批量插入、并行处理、缓存窗口，效率较高  
 ✅ **架构清晰**: 职责分离明确，符合 Laravel 最佳实践  
 
-### 7.2 潜在改进点
+### 10.2 潜在改进点
 
 #### 建议1: 增加重试机制
 **问题**: 当前网络临时故障导致同步失败后，需等待下一次定时任务（最长24小时）  
@@ -673,6 +1167,20 @@ if (abs($podcast->last_synced_at->diffInHours(now())) < 12) {
 #### 建议5: 支持增量同步
 **问题**: 每次同步都拉取完整 feed，对于大型播客效率较低  
 **建议**: 对支持 RFC5005（Feed Paging and Archiving）的 feed 实现增量同步
+
+#### 建议6: 修复 GUID 全局唯一性约束问题（高优先级）
+**问题**: 数据库层 `episode_guid` 是全局唯一约束，但应用层仅检查当前播客内的 GUID 重复，导致跨播客 GUID 冲突时整个播客同步失败（详见第8章分析）  
+**建议**: 
+1. 将数据库唯一约束改为 `(podcast_id, episode_guid)` 复合唯一索引
+2. 在应用层增加全局 GUID 冲突检查，提前过滤冲突剧集
+3. 对已存在的冲突数据进行数据迁移处理
+
+#### 建议7: 增强批量插入的容错性
+**问题**: `synchronizeEpisodes()` 中的批量插入是原子操作，单条记录失败（如唯一约束冲突）会导致整批新剧集无法插入  
+**建议**: 
+1. 在批量插入前增加更严格的数据校验
+2. 考虑使用 `insertOrIgnore()` 或分批次插入，允许部分成功
+3. 捕获批量插入异常，降级为单条插入并标记失败剧集
 
 ---
 
