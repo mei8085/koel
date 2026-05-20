@@ -4,11 +4,12 @@
 - **分析对象**: Koel 播客订阅同步功能
 - **代码版本**: 当前工作目录
 - **分析日期**: 2026-05-20
-- **文档版本**: v1.2（补充 sync 与异步驱动条件分支、调度器前置条件与缺失表现分析）
+- **文档版本**: v1.3（补充调度可靠性分析：平台适用条件、初始化容错、多实例并发风险）
 - **更新历史**:
   - v1.0: 初始版本，覆盖主流程
   - v1.1: 补充调度队列链路、异常隔离界限、GUID 唯一性风险分析
   - v1.2: 补充 sync 与异步驱动执行路径差异、调度器前置条件与缺失表现
+  - v1.3: 修正 scheduler 平台适用条件、补充初始化容错表现、多实例并发风险分析
 - **文档目的**: 详细阐述播客订阅同步的完整实现链路，为代码复核提供依据
 
 ---
@@ -823,7 +824,7 @@ readonly class DeletePodcastIfNoSubscribers implements ShouldQueue
 
 #### 前置条件1: Cron 任务配置
 
-**安装命令**: [app/Console/Commands/InstallSchedulerCommand.php](file:///d:/fz/0508-2\solo-dogfeeding\code\88-koel\app\Console\Commands\InstallSchedulerCommand.php)
+**安装命令**: [app/Console/Commands/InstallSchedulerCommand.php](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Console/Commands/InstallSchedulerCommand.php)
 
 ```bash
 php artisan koel:scheduler:install
@@ -839,9 +840,24 @@ $crontab->persist();
 ```
 
 > **代码事实**: 
-> 1. 该命令仅支持 Linux 系统（Windows 返回错误）
-> 2. 向当前用户的 crontab 添加每分钟执行的 `schedule:run` 任务
-> 3. 输出重定向到 `/dev/null`，不保留日志
+> 1. 向当前用户的 crontab 添加每分钟执行的 `schedule:run` 任务
+> 2. 输出重定向到 `/dev/null`，不保留日志
+
+**平台适用条件的修正分析**：
+
+原代码中的平台判断：
+```php
+if (PHP_OS_FAMILY === 'Windows' || PHP_OS_FAMILY === 'Unknown') {
+    $this->components->error('This command is only available on Linux systems.');
+    return self::FAILURE;
+}
+```
+
+> **实际限制条件分析**（不仅仅是 Linux）：
+> 1. **支持的平台**：Linux、macOS（Darwin）、以及任何使用 crontab 的 Unix-like 系统
+> 2. **不支持的平台**：Windows（`PHP_OS_FAMILY === 'Windows'`）、未知操作系统（`PHP_OS_FAMILY === 'Unknown'`）
+> 3. **隐含依赖**：必须安装并启用 crontab 服务，当前用户必须有权限编辑 crontab
+> 4. **文档与代码差异**：[docs/cli-commands.md:305](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/docs/cli-commands.md#L305-L305) 说明 Standalone Binary 启动器有自己的 cron 写入机制
 
 **安装状态检查**：
 ```php
@@ -850,6 +866,92 @@ public static function schedulerInstalled(CrontabRepository $crontab): bool
     return (bool) $crontab->findJobByRegex('/artisan schedule:run/');
 }
 ```
+
+> **检查逻辑局限性**：仅检查是否存在包含 `artisan schedule:run` 的 cron 条目，不验证该条目是否正确、是否属于正确用户、是否可执行。
+
+#### 前置条件1.1: 初始化阶段调度安装的容错处理
+
+调度安装在初始化流程中的调用：[app/Console/Commands/InitCommand.php:421-428](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/app/Console/Commands/InitCommand.php#L421-L428)
+
+```php
+$this->components->task('Installing Koel scheduler', static function () use (&$result): void {
+    $result = Artisan::call('koel:scheduler:install', ['--quiet' => true]);
+});
+
+if ($result !== self::SUCCESS) {
+    $this->components->warn('Failed to install scheduler. '
+    . 'Please install manually: https://docs.koel.dev/cli-commands#command-scheduling');
+}
+```
+
+> **代码事实**: 
+> 1. 初始化时自动尝试安装调度器，但失败**仅告警不阻断**
+> 2. 失败时输出警告信息并提供文档链接
+> 3. 初始化流程继续执行，不会因为调度安装失败而回滚
+
+**安装失败时的可观测表现**：
+
+| 失败场景 | 初始化时的表现 | 运行时的表现 |
+|---------|--------------|------------|
+| 平台不支持（Windows） | 显示红色错误信息：`This command is only available on Linux systems.`，随后显示黄色警告提示手动安装 | 所有定时任务（扫描、清理、播客同步等）都不会自动执行，用户必须手动运行命令 |
+| crontab 服务未安装 | 命令执行失败，可能抛出异常，显示黄色警告 | 同上，所有定时任务不执行 |
+| 用户无 crontab 权限 | 命令执行失败（permission denied），显示黄色警告 | 同上，所有定时任务不执行 |
+| PHP CLI 路径不在 crontab PATH 中 | 安装成功但 cron 执行时找不到 php 命令 | 调度器被标记为已安装，但实际上 `schedule:run` 从未成功执行，所有定时任务不执行 |
+| 已存在相同 cron 条目 | 显示 `Koel scheduler is already installed. Skipping…`，无警告 | 正常运行 |
+
+> **可观测性风险**：由于安装失败不阻断初始化，用户可能忽略警告信息，导致部署完成后定时任务静默失败。需要通过 `php artisan koel:doctor` 命令检查调度器状态。
+
+#### 前置条件1.2: 多实例部署的并发风险
+
+**当前调度配置**: [routes/console.php:6-11](file:///d:/fz/0508-2/solo-dogfeeding/code/88-koel/routes/console.php#L6-L11)
+
+```php
+Schedule::job(new RunCommandJob('koel:scan'))->daily();
+Schedule::job(new RunCommandJob('koel:prune'))->daily();
+Schedule::job(new RunCommandJob('koel:podcasts:sync'))->daily();
+Schedule::job(new RunCommandJob('koel:clean-up-temp-files'))->daily();
+Schedule::job(new RunCommandJob('koel:clean-up-duplicate-uploads'))->daily();
+Schedule::job(new RunCommandJob('model:prune'))->daily();
+```
+
+> **关键发现**: 所有调度任务**都没有**使用 `onOneServer()` 或 `withoutOverlapping()` 方法。
+
+**Laravel 调度锁机制说明**：
+- `withoutOverlapping()`: 防止同一任务在前一个实例还未完成时重复启动
+- `onOneServer()`: 在多实例部署时，确保任务只在其中一个实例上运行
+
+**未使用锁机制的风险分析**：
+
+| 风险场景 | 触发条件 | 影响范围 | 可能后果 |
+|---------|---------|---------|---------|
+| **重复触发（单机）** | `QUEUE_CONNECTION=sync` 且同步任务耗时超过 1 分钟 | 所有 daily 任务 | 同一时间多个同步进程并发执行，导致数据库死锁、资源竞争、数据不一致 |
+| **并发执行（多实例）** | 部署了多个 Koel 实例且共享同一数据库 | 所有 daily 任务 | 多个实例同时执行相同任务（如扫描、同步），重复处理相同数据，浪费资源，可能导致数据冲突 |
+| **任务堆积** | 同步任务耗时超过 24 小时（极端情况） | 所有 daily 任务 | 新的任务不断启动，系统负载持续上升，最终可能导致服务不可用 |
+| **播客同步冲突** | 多实例同时同步相同播客 | 播客同步 | 重复插入剧集（虽然有 GUID 唯一约束）、数据库事务冲突、死锁 |
+
+**特别针对播客同步的风险**：
+
+播客同步任务的特点使其更容易受到并发影响：
+1. 网络 I/O 密集，耗时不确定（取决于 feed 大小和网络速度）
+2. 执行数据库写入操作（插入剧集、更新播客元数据）
+3. 可能启动多个并行子进程（`--jobs` 参数）
+
+并发同步相同播客的可能后果：
+- `synchronizeEpisodes()` 中批量插入时的唯一约束冲突（虽然有应用层过滤，但高并发下仍可能出现竞态条件）
+- 播客元数据更新冲突（`$podcast->update()`）
+- 重复的 HTTP 请求给 feed 服务器造成压力
+- 数据库连接耗尽
+
+**风险缓解建议**：
+```php
+// 建议的改进后的调度配置
+Schedule::job(new RunCommandJob('koel:podcasts:sync'))
+    ->daily()
+    ->withoutOverlapping()           // 防止单机重复
+    ->onOneServer();                  // 多实例时只在一台运行
+```
+
+> **注意**: `onOneServer()` 需要缓存驱动支持（如 Redis、Memcached），不能使用 `array` 或 `file` 缓存驱动。
 
 #### 前置条件2: Queue Worker 进程（异步驱动时）
 
@@ -1378,6 +1480,30 @@ if (abs($podcast->last_synced_at->diffInHours(now())) < 12) {
 1. 在批量插入前增加更严格的数据校验
 2. 考虑使用 `insertOrIgnore()` 或分批次插入，允许部分成功
 3. 捕获批量插入异常，降级为单条插入并标记失败剧集
+
+#### 建议8: 增加调度任务锁机制（高优先级，多实例部署必需）
+**问题**: 当前调度任务没有使用 `withoutOverlapping()` 和 `onOneServer()`，单机部署时任务耗时超过 1 分钟会重复触发，多实例部署时多个实例会同时执行相同任务（详见第 5.6.2 节分析）  
+**建议**:
+```php
+Schedule::job(new RunCommandJob('koel:podcasts:sync'))
+    ->daily()
+    ->withoutOverlapping()           // 防止单机重复执行
+    ->onOneServer();                  // 多实例时只在一台执行
+```
+**注意**: `onOneServer()` 需要缓存驱动支持（如 Redis），需确保配置正确。
+
+#### 建议9: 增强调度安装失败的可观测性
+**问题**: 初始化时调度安装失败仅告警不阻断，用户可能忽略警告导致定时任务静默失败（详见第 5.6.1 节分析）  
+**建议**:
+1. 在 `koel:doctor` 命令中增加调度器状态的深度检查（不仅检查是否存在，还要验证上次执行时间）
+2. 在管理后台增加调度器状态展示
+3. 考虑增加健康检查接口，供监控系统调用
+
+#### 建议10: 修正平台判断逻辑和文档
+**问题**: 代码中提示 "only available on Linux systems"，但实际上支持所有 Unix-like 系统（包括 macOS），误导用户  
+**建议**:
+1. 将错误信息修改为 "This command is only available on Unix-like systems (Linux, macOS, etc.)"
+2. 在文档中明确说明 Windows 系统需要手动配置任务计划程序
 
 ---
 
