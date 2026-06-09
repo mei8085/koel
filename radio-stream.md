@@ -301,14 +301,13 @@ const toggle = async () => {
 
 ```typescript
 public async play(station: RadioStation) {
-1. `radioStationStore.current` = 第一个 playback_state !== 'Stopped' 的电台，否则 null
-
+  use(radioStationStore.current, station => (station.playback_state = 'Stopped'))
 
   station.playback_state = 'Playing'
   this.media.src = radioStationStore.getSourceUrl(station)
   await this.media.play()
 
-  radioStationStore.startPolling(station)  // 开始元数据轮询
+  radioStationStore.startPolling(station)
   socketService.broadcast('SOCKET_STREAMABLE', station)
 }
 ```
@@ -480,7 +479,7 @@ async fetchNowPlaying(station: RadioStation) {
 
 元数据展示在底部播放栏的电台信息区域，位于电台名称下方。
 
-**关键代码**：[FooterRadioStationInfo.vue#L8-L13](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/components/layout/app-footer/FooterRadioStationInfo.vue#L8-L13)
+**关键代码**：[FooteradioStationInfo.vue#L8-L13](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/components/layout/app-footer/FooteradioStationInfo.vue#L8-L13)
 
 ```vue
 <h3 class="title truncate">{{ station.name }}</h3>
@@ -558,7 +557,7 @@ RadioStreamProxy.proxyWithMetadata()
                       radioStationStore.nowPlaying 更新
                                     │
                                     ▼
-                          FooterRadioStationInfo 展示
+                          FooteradioStationInfo 展示
 ```
 
 ### 5.3 切回本地曲库的链路
@@ -857,7 +856,7 @@ stationA.playback_state = 'Playing'
 **场景三：恢复播放同一电台（Paused  Playing）**
 
 ```
-初始值：stationA (Paused)   （Paused  Stopped，所以 current 是 stationA）
+初始值：stationA (Paused)   （Paused ≠ Stopped，所以 current 是 stationA）
   
 stationA.playback_state = 'Stopped'
    current 瞬时 = null     （中间状态，被批处理忽略）
@@ -960,7 +959,7 @@ const isRadio = computed(() => currentStreamable.value && isRadioStation(current
 
 **显示判断链**：
 1. `currentStreamable` 有值吗？ → 没有则显示空状态 / 默认占位
-2. 有值的话，是电台类型吗？ → 是则渲染 `FooterRadioStationInfo`
+2. 有值的话，是电台类型吗？ → 是则渲染 `FooteradioStationInfo`
 3. 否则渲染 `FooterPlayableInfo`（歌曲 / 播客）
 
 **播放按钮的行为**：
@@ -994,8 +993,8 @@ const toggle = async () => {
 
 **判定规则（可复核）：**
 
-1. 
-adioStationStore.current = 第一个 playback_state !== 'Stopped' 的电台，否则 null
+1. `radioStationStore.current` = 第一个 playback_state  'Stopped' 的电台，否则 null
+
 2. queueStore.current = 第一个 playback_state !== 'Stopped' 的歌曲，否则 fallback 查找
 3. 队列 watcher 先创建，无条件赋值；电台 watcher 后创建，仅当 station 为真值时覆盖
 4. 同一 tick 内的状态变化被 Vue 批处理，watcher 只比较最终值与上一次回调的旧值
@@ -1007,7 +1006,7 @@ adioStationStore.current = 第一个 playback_state !== 'Stopped' 的电台，�
 |---|---------|---------|---------------------------|-------------------|-------------------|-----------|------|
 | 1 | Stopped | Stopped | null | null / fallback | null / fallback | 空/上次歌曲 | 都没在播放 |
 | 2 | Playing | Stopped | stationA | null | stationA | 电台信息 | 只有电台在播 |
-| 3 | Paused | Stopped | stationA | null | stationA | 电台信息（暂停） | Paused  Stopped，电台仍是 current |
+| 3 | Paused | Stopped | stationA | null | stationA | 电台信息（暂停） | Paused ≠ Stopped，电台仍是 current |
 | 4 | Stopped | Playing | null | songX | songX | 歌曲信息 | 只有队列在播 |
 | 5 | Stopped | Paused | null | songX | songX | 歌曲信息（暂停） | 队列 Paused 也算 current |
 | 6 | Playing | Paused | stationA | songX | stationA | 电台信息 | 两者都有状态，电台 watcher 后执行覆盖 |
@@ -1074,3 +1073,6 @@ adioStationStore.current = 第一个 playback_state !== 'Stopped' 的电台，�
 | 流代理 | [RadioStreamProxy.php](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/app/Services/Radio/RadioStreamProxy.php) |
 | 元数据处理 | [RadioStreamMetadata.php](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/app/Services/Radio/RadioStreamMetadata.php) |
 | 元数据接口 | [RadioStationNowPlayingController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/app/Http/Controllers/API/RadioStationNowPlayingController.php) |
+
+
+
