@@ -240,39 +240,100 @@ getSourceUrl: (playable: Playable) => {
 
 ### 3.5 会话保持链路详解
 
-从 `?t=` 参数到解析为当前用户，完整链路涉及 Guard 驱动、Token 解析、权限验证三层核心环节。下面逐层分析各组件的职责与关联。
+从 `?t=` 参数到解析为当前用户，完整链路涉及 Guard 驱动、Token 解析、权限验证三层核心环节。下面沿着 Laravel 框架层深入追踪各组件的实际调用路径与关联。
 
-#### 3.5.1 双 Guard 架构
+#### 3.5.1 双 Guard 架构：配置与实际生效
 
-[config/auth.php](config/auth.php) 定义了两个独立的认证 Guard，分别服务于不同场景：
+[config/auth.php](config/auth.php) 定义了两个认证 Guard，但**配置中的默认值 ≠ 实际生效的 Guard**。
+
+**配置文件定义**：
 
 ```php
+// config/auth.php
+'defaults' => [
+    'guard' => 'api',      // 配置中的默认 Guard
+    'passwords' => 'users',
+],
+
 'guards' => [
     'web' => [
-        'driver' => 'token-via-query-parameter',
+        'driver' => 'token-via-query-parameter',  // 自定义驱动
         'provider' => 'users',
     ],
     'api' => [
-        'driver' => 'sanctum',
+        'driver' => 'sanctum',                    // Sanctum 官方驱动
         'provider' => 'users',
     ],
 ],
 ```
 
-| Guard 名称 | 驱动类型 | 用途 | Token 来源 |
-|-----------|----------|------|-----------|
-| `web` | `token-via-query-parameter`（自定义） | 播放、下载、Last.fm 回调等 Web 路由 | URL 查询参数 `api_token` 或 `t` |
-| `api` | `sanctum`（默认） | API 数据接口 | `Authorization: Bearer` 请求头 |
+**实际生效规则**：
 
-- 默认 Guard 为 `api`
-- 两个 Guard 共享同一个 `users` Provider（Eloquent User 模型）
-- 两者底层都依赖 Laravel Sanctum 的 `PersonalAccessToken` 模型存储 Token
+Laravel 的设计约定是「路由所在的中间件组决定默认 Guard」：
 
-**关键区别**：两个 Guard 的核心差异在于「如何从请求中提取 Token」不同，但最终都通过 `PersonalAccessToken` 表查询 Token 记录并通过 `tokenable` 多态关系获取用户。
+| 路由中间件组 | 实际默认 Guard | 驱动 | Token 提取方式 | 典型场景 |
+|-------------|--------------|------|---------------|----------|
+| `web` 组 | `web` guard | `token-via-query-parameter` | 查询参数 `api_token` / `t` | 播放、下载、Last.fm 回调 |
+| `api` 组 | `api` guard | `sanctum` | `Authorization: Bearer` Header | 数据读写、状态同步 |
 
-#### 3.5.2 自定义 Guard 驱动：token-via-query-parameter
+> **验证依据**：[LastfmTest.php](tests/Feature/LastfmTest.php) 第 40 行 Mock `TokenManager::getUserFromPlainTextToken()` 被期望调用，证明 web 路由上自定义驱动确实参与了认证。
 
-[AuthServiceProvider](app/Providers/AuthServiceProvider.php) 的 `boot()` 方法中通过 `Auth::viaRequest()` 注册了自定义认证驱动：
+**核心设计洞察**：
+- 两个 Guard 不是「两套独立认证体系」，而是「同一套 Token 存储 + 两种 Token 提取方式」
+- 两者底层都依赖 Sanctum 的 `PersonalAccessToken` 模型
+- 差异仅在于「从哪里提取 Token 字符串」，验证逻辑完全一致
+- 都能设置 `currentAccessToken`，因此都支持 `tokenCan()` 权限检查
+
+#### 3.5.2 $request->user() 的框架层调用链
+
+`$request->user()` 是认证链路的总入口。沿着 Laravel 框架层向下追踪，调用链如下：
+
+```
+Illuminate\Http\Request::user($guard = null)
+    │
+    ├─ 调用 $this->userResolver 闭包
+    │   （由框架在服务容器初始化时注册）
+    │
+    ▼
+    userResolver($guard)
+    │
+    ├─ 调用 auth() 辅助函数 → 获取 AuthManager 实例
+    │
+    ▼
+    auth()->guard($guard)->user()
+    │
+    ├─ $guard = null → 使用默认 Guard
+    │   （由路由中间件组决定）
+    │
+    ▼
+    defaultGuard()->user()
+    │
+    └─ 根据 Guard 驱动类型执行不同逻辑：
+       ├─ web guard → RequestGuard → 执行 viaRequest 闭包
+       └─ api guard → Sanctum Guard → 执行 Sanctum 认证逻辑
+```
+
+**关键细节说明**：
+
+1. **userResolver 的注入**：Laravel 在 `AuthServiceProvider` 中通过 `$request->setUserResolver()` 将用户解析器闭包注入到 Request 实例。
+
+2. **默认 Guard 的动态切换**：当请求进入 web 中间件组时，框架将默认 Guard 设置为 `web`；进入 api 中间件组时设置为 `api`。这解释了为什么同一段 `$request->user()` 代码在不同路由上行为不同。
+
+3. **惰性求值**：`$request->user()` 采用惰性求值，首次调用时才执行认证逻辑，结果会被 Guard 缓存，后续调用直接返回缓存的用户。
+
+**对 AudioAuthenticate 的影响**：
+
+[AudioAuthenticate](app/Http/Middleware/AudioAuthenticate.php) 第 13 行：
+
+```php
+abort_unless($request->user()?->tokenCan('audio'), Response::HTTP_UNAUTHORIZED);
+```
+
+由于播放路由位于 `web` 中间件组内，这里的 `$request->user()` 使用 **web Guard**，走 `token-via-query-parameter` 驱动，从 `?t=` 参数提取 Token。
+
+#### 3.5.3 自定义驱动：token-via-query-parameter
+
+`web` Guard 的驱动由 [AuthServiceProvider](app/Providers/AuthServiceProvider.php) 第 20 行通过 `Auth::viaRequest()` 注册：
 
 ```php
 Auth::viaRequest('token-via-query-parameter', static function (Request $request): ?User {
@@ -282,22 +343,25 @@ Auth::viaRequest('token-via-query-parameter', static function (Request $request)
 });
 ```
 
-**实现细节**：
-- `viaRequest()` 是 Laravel 提供的「请求级闭包认证」方式，用于快速实现自定义 Guard 驱动
-- 支持两个参数名：`api_token`（Last.fm 回调等场景）和 `t`（音频播放场景）
-- Token 解析逻辑完全委托给 `TokenManager::getUserFromPlainTextToken()`
-- 解析失败时返回 `null`，表示未认证
+**viaRequest 的工作原理**：
 
-**与 Sanctum 的关系**：
-- 该自定义驱动仅负责「从请求中提取 Token」
-- 实际的 Token 查找和用户解析仍然使用 Sanctum 的 `PersonalAccessToken` 模型
-- 这是一种「轻量级自定义 Guard + Sanctum 底层存储」的混合架构
+| 层级 | 组件 | 说明 |
+|------|------|------|
+| 注册层 | `Auth::viaRequest($name, $callback)` | 在 AuthManager 中注册一个自定义驱动 |
+| 实例化层 | `RequestGuard` | Laravel 为 viaRequest 驱动创建的 Guard 实例 |
+| 执行层 | 闭包函数 | 调用 `guard()->user()` 时执行，接收 `$request`，返回 User 或 null |
 
-#### 3.5.3 TokenManager：Token 解析用户
+**驱动逻辑拆解**：
+1. 从请求查询参数中尝试获取 `api_token`，若无则尝试 `t`
+2. 若两者都没有，传空字符串给 `getUserFromPlainTextToken()`
+3. `TokenManager` 负责实际的 Token 查找和用户解析
+4. 找到则返回 User 模型，找不到返回 `null`
 
-[TokenManager](app/Services/Auth/TokenManager.php) 是 Token 操作的核心服务，负责 Token 的创建、删除和用户解析。
+#### 3.5.4 Token 解析与 currentAccessToken 的绑定来源
 
-`getUserFromPlainTextToken()` 方法是认证链路的关键环节：
+这是理解认证链路最关键的一环：**自定义驱动返回的 User 模型上，currentAccessToken 是从哪里来的？**
+
+**TokenManager 的解析方法** [TokenManager.php](app/Services/Auth/TokenManager.php) 第 54 行：
 
 ```php
 public function getUserFromPlainTextToken(#[SensitiveParameter] string $plainTextToken): ?User
@@ -306,163 +370,232 @@ public function getUserFromPlainTextToken(#[SensitiveParameter] string $plainTex
 }
 ```
 
-**执行流程**：
-1. 调用 `PersonalAccessToken::findToken()` 查找 Token 记录
-2. `findToken()` 内部解析 Token 格式（`ID|plain-text`）
-3. 按 ID 查询数据库，比对哈希后的明文
-4. 通过 `tokenable` 多态关系获取关联的 User 模型
-5. 找不到 Token 或 Token 无效时返回 `null`
+看似简单的一行代码，实际包含了「Token 查找 → 用户获取 → Token 自动绑定」三步。
 
-**Sanctum 的 findToken() 内部逻辑**：
-- Token 格式为 `{id}|{plain_text}`
-- 先按 ID 查询 `personal_access_tokens` 表
-- 使用 SHA-256 哈希比对明文
-- 返回 `PersonalAccessToken` 模型实例
+**逐阶段追踪**：
 
-#### 3.5.4 AudioAuthenticate 的调用链
+**第一阶段：PersonalAccessToken::findToken()**
 
-[AudioAuthenticate](app/Http/Middleware/AudioAuthenticate.php) 是音频播放的认证中间件，别名 `audio.auth`。
+- 接收明文 Token，格式为 `{id}|{plain_text}`
+- 解析出 ID，查询 `personal_access_tokens` 表
+- 使用 SHA-256 哈希比对明文验证
+- 验证通过返回 `PersonalAccessToken` Eloquent 模型
+
+**第二阶段：访问 ->tokenable 属性**
+
+这是自动绑定的关键。`tokenable` 是 Sanctum 定义的「多态关联」，其访问器（getter）中包含了绑定逻辑：
+
+```
+$token->tokenable
+    │
+    ├─ 触发 Eloquent 多态关联加载
+    │
+    ├─ 获取关联的 User 模型
+    │
+    └─ 在返回 User 之前：
+        $user->withAccessToken($token)
+        │
+        └─ 设置 $user->currentAccessToken = $token
+```
+
+**withAccessToken 方法**由 `HasApiTokens` trait 提供，它将当前 Token 设置到 User 模型的 `currentAccessToken` 属性上。
+
+**关键结论**：
+> `currentAccessToken` 的绑定发生在 `PersonalAccessToken` 模型的 `tokenable` 关联访问器中。**无论通过什么方式获取到 PersonalAccessToken，只要访问它的 tokenable 属性，就会自动将自身绑定为 User 的 currentAccessToken。**
+
+这就是为什么自定义 viaRequest 驱动返回的 User 也能正确使用 `tokenCan()` 的原因 —— 因为 `tokenable` 关系自带绑定逻辑。
+
+#### 3.5.5 tokenCan 的工作原理：与 Guard 无关
+
+`tokenCan()` 的工作完全不依赖于 Guard，它的唯一依赖是 `currentAccessToken` 属性。
+
+**定义与实现**：
+
+`tokenCan()` 由 `Laravel\Sanctum\HasApiTokens` trait 提供，[User 模型](app/Models/User.php) 第 64 行引入了该 trait：
 
 ```php
-public function handle(Request $request, Closure $next)
-{
-    abort_unless($request->user()?->tokenCan('audio'), Response::HTTP_UNAUTHORIZED);
-
-    return $next($request);
-}
+use HasApiTokens;
 ```
 
-**调用链分解**：
+**执行逻辑**：
 
-**第一步：`$request->user()` 触发认证**
-
-`$request->user()` 是整个认证链路的触发点。它内部调用 `auth()->user()`，使用默认 Guard（`api`，Sanctum 驱动）。
-
-但对于携带 `?t=` 或 `?api_token=` 的 Web 路由请求，实际认证通过 `web` Guard 的 `token-via-query-parameter` 驱动生效（从 Last.fm 测试的 TokenManager 被调用可以验证）。
-
-> **验证依据**：[LastfmTest.php](tests/Feature/LastfmTest.php) 中 Mock `TokenManager::getUserFromPlainTextToken()` 被期望调用，证明自定义驱动参与了认证过程。
-
-**第二步：`tokenCan('audio')` 权限检查**
-
-`tokenCan()` 是 Sanctum `HasApiTokens` trait 提供的方法，用于检查当前认证 Token 的能力（abilities）。
-
-它检查 `personal_access_tokens.abilities` 字段中是否包含指定能力或 `*`（通配符）。
-
-对于 Audio Token，abilities 为 `['audio']`；对于 API Token，abilities 为 `['*']`。
-
-**与 Authenticate 中间件的对比**：
-
-| 中间件 | 检查的能力 | 适用场景 |
-|--------|------------|----------|
-| `AudioAuthenticate` | `audio` | 播放、下载等音频相关路由 |
-| `Authenticate`（`auth` 别名） | `*`（全权限） | API 数据接口 |
-
-#### 3.5.5 Authenticate.php 是否参与播放路由认证？
-
-**结论：播放路由认证过程中，`app/Http/Middleware/Authenticate.php` **不参与**。
-
-**原因分析**：
-
-1. **路由中间件不同**：
-   - 播放路由使用 `audio.auth` 中间件（`AudioAuthenticate` 类）
-   - 播放路由定义在 [routes/web.base.php](routes/web.base.php) 第 47 行，使用 `Route::middleware('audio.auth')->group(...)` 中
-   - `auth` 中间件（无论哪个 Authenticate）仅用于需要全权限认证的路由（如 Last.fm 连接）
-
-2. **Koel 的自定义 Authenticate 角色存疑**：
-   - [app/Http/Middleware/Authenticate.php](app/Http/Middleware/Authenticate.php) 文件存在
-   - 但在 [bootstrap/app.php](bootstrap/app.php) 中未注册为 `auth` 别名
-   - `bootstrap/app.php` 仅注册了 `audio.auth` 和 `os.auth` 两个别名
-   - `auth` 中间件别名由 Laravel 框架默认提供
-
-3. **框架 Authenticate 的证据**：
-   - [AuthTest.php](tests/Feature/AuthTest.php) 第 58 行注释提到「Laravel 12's Authenticate middleware」
-   - `bootstrap/app.php` 中 `$middleware->redirectGuestsTo('/')` 是配置框架 Authenticate 中间件的重定向路径
-   - 这表明 `auth` 中间件别名指向框架的 `Illuminate\Auth\Middleware\Authenticate`
-
-4. **Koel 自定义 Authenticate 的现状**：
-   - 自定义 `App\Http\Middleware\Authenticate` 类存在但未显式注册为 `auth` 别名
-   - 其实现与框架 Authenticate 类似但更简化（检查 `tokenCan('*')`）
-   - 可能为遗留代码或替代方案，当前是否被 `auth` 别名实际生效
-
-**对播放路由的影响**：
-- 播放路由不经过 `auth` 中间件
-- 播放路由经过 `audio.auth` 中间件
-- 所以无论是哪个 Authenticate 都不参与播放路由的认证过程
-
-#### 3.5.6 tokenCan 的工作原理
-
-`tokenCan()` 方法由 Sanctum 的 `HasApiTokens` trait 提供，定义在 `Laravel\Sanctum\HasApiTokens` 中。
-
-**User 模型中的使用**：
-- [User.php](app/Models/User.php) 第 23 行引入 `HasApiTokens` trait
-- 第 64 行 `use HasApiTokens;`
-
-**工作原理**：
-
-1. **currentAccessToken**：当用户通过 Token 认证后，Sanctum 会将当前使用的 Token 设置到 User 模型的 `currentAccessToken` 属性上
-
-2. **tokenCan() 方法**：
-   - 检查 `currentAccessToken` 是否存在
-   - 调用 Token 模型的 `can()` 方法检查 abilities
-   - 支持 `*` 通配符（表示所有权限）
-
-3. **abilities 存储**：
-   - 存储在 `personal_access_tokens.abilities` 字段（JSON 类型）
-   - 创建 Token 时指定，如 `['audio']` 或 `['*']`
+```
+$user->tokenCan('audio')
+    │
+    ├─ 读取 $this->currentAccessToken
+    │
+    ├─ 若 currentAccessToken 为空 → 返回 false
+    │
+    ├─ 检查 abilities 是否包含 '*' → 是则返回 true
+    │
+    └─ 检查 abilities 是否包含指定能力 → 返回结果
+```
 
 **与 Guard 的关系**：
-- `tokenCan()` 方法与使用哪个 Guard 无关
-- 只要是通过 Sanctum Token 认证的用户（无论是通过哪个 Guard 驱动），都可以使用 `tokenCan()` 检查权限
-- 这是因为两个 Guard 最终都使用 `PersonalAccessToken` 模型，认证后都会设置 `currentAccessToken`
 
-#### 3.5.7 完整认证调用链总结
+| Guard | 认证方式 | 是否设置 currentAccessToken | tokenCan 是否可用 |
+|-------|---------|--------------------------|------------------|
+| web guard（自定义驱动） | 查询参数 Token + PersonalAccessToken + tokenable | ✅ 通过 tokenable 自动绑定 | ✅ 可用 |
+| api guard（Sanctum 驱动） | Header Token + Sanctum Guard | ✅ Sanctum Guard 显式设置 | ✅ 可用 |
 
-**播放路由（`?t=` 参数）的完整认证链路**：
+**设计意义**：
+- `tokenCan()` 与 Guard 解耦，只要 User 模型上设置了 `currentAccessToken`，就能检查权限
+- 这使得「双 Guard 架构」成为可能：两种不同的认证入口，共享同一套权限检查机制
+- 权限数据存储在 `personal_access_tokens.abilities` 字段（JSON 类型）
+
+**权限对比表**：
+
+| Token 类型 | abilities | tokenCan('audio') | tokenCan('*') | 用途 |
+|-----------|-----------|-------------------|---------------|------|
+| API Token | `['*']` | ✅ 通过 | ✅ 通过 | API 请求、全权限操作 |
+| Audio Token | `['audio']` | ✅ 通过 | ❌ 不通过 | 仅播放/下载音频 |
+
+这是双 Token 机制的安全性基础：Audio Token 即使泄露，也无法访问 API 或操作用户数据。
+
+#### 3.5.6 三层 Authenticate 角色澄清
+
+Koel 代码中存在三个不同层级的「Authenticate」概念，极易混淆。下面逐一澄清。
+
+**概念辨析表**：
+
+| 层级 | 类名 | 别名 | 注册位置 | 检查逻辑 | 适用场景 | 参与播放认证？ |
+|------|------|------|---------|----------|----------|--------------|
+| 框架层 | `Illuminate\Auth\Middleware\Authenticate` | `auth` | 框架默认 | 支持多 Guard，抛出 AuthenticationException | API 路由、需全权限的 web 路由 | ❌ 不参与 |
+| 应用层 | `App\Http\Middleware\Authenticate` | （未注册） | — | `$request->user()?->tokenCan('*')` | 可能为遗留/备用方案 | ❌ 不参与 |
+| 业务层 | `App\Http\Middleware\AudioAuthenticate` | `audio.auth` | bootstrap/app.php | `$request->user()?->tokenCan('audio')` | 播放、下载等音频路由 | ✅ 参与 |
+
+**详细分析**：
+
+**1. 框架层 Authenticate（`auth` 别名）**
+
+- Laravel 框架自带的标准认证中间件
+- [bootstrap/app.php](bootstrap/app.php) 第 47 行 `$middleware->redirectGuestsTo('/')` 配置了其重定向路径
+- 由 [AuthTest.php](tests/Feature/AuthTest.php) 第 58 行注释「Laravel 12's Authenticate middleware」印证
+- 支持多 Guard 参数：`auth:web`、`auth:api`，不传则用默认 Guard
+- 用于 API 路由和 Last.fm 等需要全权限认证的 web 路由
+
+**2. 应用层 Authenticate（自定义）**
+
+- 文件：[app/Http/Middleware/Authenticate.php](app/Http/Middleware/Authenticate.php)
+- 未在 `bootstrap/app.php` 中注册为 `auth` 别名
+- 实现简化：直接检查 `tokenCan('*')`，不支持多 Guard 参数
+- **状态判断**：当前为未激活的备用/遗留代码，`auth` 别名实际指向框架版
+
+**3. 业务层 AudioAuthenticate（`audio.auth` 别名）**
+
+- 文件：[app/Http/Middleware/AudioAuthenticate.php](app/Http/Middleware/AudioAuthenticate.php)
+- 别名 `audio.auth`，在 [bootstrap/app.php](bootstrap/app.php) 第 41 行显式注册
+- 仅检查 `audio` 权限，专用于播放、下载等音频路由
+- 是播放路由认证链路上**唯一**的认证中间件
+
+**播放路由的中间件执行路径**：
 
 ```
-GET /play/{song}?t=<audio-token>
+GET /play/{song}?t=xxx
     │
     ▼
-1. 路由匹配：web 中间件组 + audio.auth 中间件
-    │  routes/web.base.php 中定义
-    │  Route::middleware('web')->group(...)
-    │  内含 Route::middleware('audio.auth')->group(...)
-    │
+web 中间件组（StartSession、CSRF、SubstituteBindings 等）
+    │  ← 此时默认 Guard 已切换为 web
     ▼
-2. 触发认证：AudioAuthenticate::handle() 调用 $request->user()
-    │
+audio.auth 中间件（AudioAuthenticate::handle）
+    │  ← 唯一的认证检查点
+    │  1. $request->user() → web Guard → 自定义驱动
+    │  2. tokenCan('audio') → 检查权限
     ▼
-3. Guard 解析：web guard → token-via-query-parameter 驱动
-    │  AuthServiceProvider 中通过 Auth::viaRequest() 注册
-    │  从 ?t= 或 ?api_token= 提取 Token
-    │
-    ▼
-4. Token 查找：TokenManager::getUserFromPlainTextToken()
-    │  PersonalAccessToken::findToken($plainTextToken)
-    │  解析 Token ID + 哈希比对
-    │
-    ▼
-5. 用户获取：通过 tokenable 多态关系 → User 模型
-    │  Sanctum 设置 currentAccessToken 属性
-    │
-    ▼
-6. 权限验证：tokenCan('audio')
-    │  检查 abilities 包含 'audio' 或 '*'
-    │
-    ▼
-7. 请求通过 → PlayController
+PlayController
 ```
 
-**各层组件对照表**：
+**结论**：`app/Http/Middleware/Authenticate.php` 与播放路由认证**完全无关**。播放路由的认证仅通过 `audio.auth` → `AudioAuthenticate` 完成。
+
+#### 3.5.7 完整调用链全景：为什么带 t 参数的请求能通过 AudioAuthenticate
+
+将前面所有分析串联起来，带 `?t=` 参数的播放请求能通过 AudioAuthenticate 认证，完整链路如下：
+
+```
+                        请求进入
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  1. 路由匹配阶段                                    │
+│     路由：routes/web.base.php 中的播放路由           │
+│     中间件组：web + audio.auth                      │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  2. web 中间件组执行                                │
+│     ├─ StartSession、VerifyCsrfToken 等            │
+│     └─ 默认 Guard 切换为 web                        │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  3. audio.auth 中间件（AudioAuthenticate）执行      │
+│     调用 $request->user()?->tokenCan('audio')      │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  4. $request->user() 触发认证                       │
+│     ├─ userResolver 闭包                            │
+│     └─ auth()->guard('web')->user()                │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  5. web Guard 驱动执行                              │
+│     驱动名：token-via-query-parameter               │
+│     位置：AuthServiceProvider::viaRequest 闭包       │
+│     操作：从 $request->get('t') 提取 Token          │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  6. TokenManager::getUserFromPlainTextToken()       │
+│     调用 PersonalAccessToken::findToken($token)     │
+│     ├─ 解析 {id}|{plain_text} 格式                  │
+│     ├─ 按 ID 查 personal_access_tokens 表           │
+│     └─ SHA-256 哈希比对验证                         │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  7. 访问 tokenable 多态关系                         │
+│     ├─ 获取关联的 User 模型                          │
+│     └─ 自动绑定：$user->withAccessToken($token)     │
+│        （Sanctum 在 tokenable 访问器中自动调用）     │
+│        → 设置 $user->currentAccessToken             │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────┐
+│  8. tokenCan('audio') 权限检查                      │
+│     ├─ 读取 currentAccessToken->abilities          │
+│     ├─ 检查是否包含 'audio' 或 '*'                  │
+│     └─ Audio Token abilities = ['audio'] → 通过     │
+└─────────────────────────────────────────────────────┘
+                          │
+                          ▼
+                    认证通过 → PlayController
+```
+
+**各层组件职责对照表**：
 
 | 层级 | 组件 | 职责 | 关键文件 |
 |------|------|------|----------|
 | 路由层 | web 中间件组 + audio.auth 别名 | 路由分组与中间件分配 | [web.base.php](routes/web.base.php) |
-| Guard 配置 | web guard → token-via-query-parameter 驱动 | 定义 Guard 与驱动的映射 | [auth.php](config/auth.php) |
-| 驱动实现 | AuthServiceProvider + viaRequest 闭包 | 从查询参数提取 Token | [AuthServiceProvider.php](app/Providers/AuthServiceProvider.php) |
-| Token 解析 | TokenManager + PersonalAccessToken | 查找 Token 记录 → tokenable 关系获取用户 | [TokenManager.php](app/Services/Auth/TokenManager.php) |
-| 权限验证 | AudioAuthenticate + tokenCan() | 检查 Token 的 audio 能力 | [AudioAuthenticate.php](app/Http/Middleware/AudioAuthenticate.php) |
-| 中间件注册 | bootstrap/app.php | 注册 audio.auth 等中间件别名 | [bootstrap/app.php](bootstrap/app.php) |
+| Guard 层 | web Guard + token-via-query-parameter 驱动 | 定义认证方式与 Token 提取逻辑 | [auth.php](config/auth.php)、[AuthServiceProvider.php](app/Providers/AuthServiceProvider.php) |
+| Token 层 | TokenManager + PersonalAccessToken | Token 查找、哈希验证、用户解析 | [TokenManager.php](app/Services/Auth/TokenManager.php) |
+| 模型层 | User + HasApiTokens + tokenable 自动绑定 | 用户模型 + 自动绑定当前 Token + 权限检查 | [User.php](app/Models/User.php) |
+| 中间件层 | AudioAuthenticate | 认证拦截 + audio 权限检查 | [AudioAuthenticate.php](app/Http/Middleware/AudioAuthenticate.php) |
+| 注册层 | bootstrap/app.php | 中间件别名注册 | [bootstrap/app.php](bootstrap/app.php) |
+
+**核心结论**：
+1. **双 Guard 本质**：同一套 PersonalAccessToken 存储 + 两种 Token 提取方式
+2. **Guard 选择**：由路由所在中间件组决定，web 路由用 web Guard，api 路由用 api Guard
+3. **Token 自动绑定**：通过 `PersonalAccessToken->tokenable` 关系访问用户时，Sanctum 会自动将 Token 绑定为 `currentAccessToken`
+4. **tokenCan 与 Guard 无关**：只要 `currentAccessToken` 被设置，就能用 `tokenCan()` 检查权限
+5. **Authenticate.php 不参与播放认证**：`app/Http/Middleware/Authenticate.php` 不参与播放路由，播放认证只走 `audio.auth` 中间件
 
 ### 3.6 Token 注销
 
