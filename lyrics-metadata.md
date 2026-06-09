@@ -266,14 +266,14 @@ public function getAlbumInformation(Album $album): ?AlbumInformation
 
 缓存 key 由 `album information + 专辑名 + 艺术家名` 组成，TTL 1 周。
 
-内层 `fetchAlbumInformation()` 是真正的获取逻辑，包含 **Spotify 补充封面的触发条件**：
+内层 `fetchAlbumInformation()` 是真正的获取逻辑，包含 **封面来源选择与存储的完整分支**：
 
 ```php
 private function fetchAlbumInformation(Album $album): AlbumInformation
 {
     $info = $this->encyclopedia->getAlbumInformation($album) ?: AlbumInformation::make();
 
-    // 封面触发条件：本地已有封面 → 直接返回
+    // 跳过封面处理的条件：本地已有封面 → 直接返回
     // 或者：Spotify 未启用 且 百科也没返回封面 → 直接返回
     if ($album->cover || !SpotifyService::enabled() && !$info->cover) {
         return $info;
@@ -290,18 +290,19 @@ private function fetchAlbumInformation(Album $album): AlbumInformation
 }
 ```
 
-**封面触发条件解读**（`$album->cover || !SpotifyService::enabled() && !$info->cover`）：
+**封面处理触发条件解读**（`$album->cover || !SpotifyService::enabled() && !$info->cover`）：
 - 由于 `&&` 优先级高于 `||`，实际等价于：`$album->cover || (!SpotifyService::enabled() && !$info->cover)`
-- 即：如果本地已有封面 → 不调用 Spotify，直接返回
-- 或者：如果 Spotify 未启用 **且** 百科也没封面 → 不调用 Spotify，直接返回
-- 反过来说，**调用 Spotify 的条件**是：本地无封面 **且** (Spotify 已启用 **或** 百科有封面)
+- 满足以下两种情况会跳过封面处理：
+  - 本地已有封面 → 直接返回
+  - Spotify 未启用 **且** 百科也没封面 → 没有可用来源，直接返回
+- 反过来说，**进入封面处理流程的条件**是：本地无封面 **且** (Spotify 已启用 **或** 百科有封面)
 
-然后 `fetchAndStoreAlbumCover()` 执行实际获取和存储：
+然后 `fetchAndStoreAlbumCover()` 执行实际获取和存储，这里有**关键的分支逻辑**：
 
 ```php
 private function fetchAndStoreAlbumCover(Album $album, AlbumInformation $info): ?string
 {
-    // Spotify 启用时用 Spotify 搜索，否则用百科返回的封面
+    // Spotify 启用时优先用 Spotify 搜索，未启用时才用百科返回的封面
     $coverUrl = SpotifyService::enabled() ? $this->spotifyService->tryGetAlbumCover($album) : $info->cover;
 
     if (!$coverUrl) {
@@ -315,6 +316,22 @@ private function fetchAndStoreAlbumCover(Album $album, AlbumInformation $info): 
     return image_storage_url($fileName);
 }
 ```
+
+**封面来源优先级与 fallback 逻辑**：
+
+**分支 A：Spotify 已启用**
+
+- **优先调用 Spotify 搜索封面（主来源）
+- 如果 Spotify 搜到了 → 下载到本地存储，更新数据库 `albums.cover`，返回本地 URL
+- 如果 Spotify 没搜到 → 返回 null，然后通过 `?? $info->cover` fallback 到百科封面（远程 URL，不下载到本地）
+
+**分支 B：Spotify 未启用**
+
+- 直接使用百科返回的封面作为来源
+- 如果百科有封面 → 下载到本地存储，更新数据库，返回本地 URL
+- 如果百科没封面 → 返回 null，`$info->cover 保持为空
+
+**重要差异**：当 Spotify 启用但搜索失败时，fallback 到的百科封面不会被下载到本地存储，只作为远程 URL 返回；而当 Spotify 未启用时，百科封面会被下载到本地。
 
 ##### 2.2.3.5 Spotify 搜索查询
 
@@ -653,7 +670,21 @@ iTunes API 调用使用 [Saloon](https://docs.saloon.dev/) HTTP 客户端封装�
 |--------|-----|------|
 | iTunes 曲目 URL | 1 周 | [ITunesService.php](file:///d:/fz/0508-2/solo-dogfeeding/code/112-koel/app/Services/Integrations/ITunesService.php#L26-L29) |
 
-#### 3.1.4 扫描阶段内存缓存
+缓存 key 生成：`cache_key('iTunes track URL', serialize($request->query()))`，将所有查询参数序列化后作为 key 一部分，确保不同搜索词、不同专辑有独立缓存。
+
+#### 3.1.4 Spotify Access Token 缓存
+
+| 缓存项 | TTL | 位置 |
+|--------|-----|------|
+| Spotify Access Token | 59 分钟（1 小时减 1 分钟缓冲） | [SpotifyClient.php](file:///d:/fz/0508-2/solo-dogfeeding/code/112-koel/app/Http/Integrations/Spotify/SpotifyClient.php#L30-L41) |
+
+缓存 key：`spotify.access_token`（常量 `ACCESS_TOKEN_CACHE_KEY`）。
+
+与业务数据缓存分离，独立管理。采用 Client Credentials Flow（客户端凭证模式），无需用户授权，适合服务端调用。
+
+首次调用时自动获取 Token 并缓存，后续调用直接从缓存读取。59 分钟的 TTL 比 Spotify 官方 1 小时有效期少 1 分钟，作为安全缓冲避免边界过期。
+
+#### 3.1.5 扫描阶段内存缓存
 
 扫描时使用 [ScannerCacheStrategy](file:///d:/fz/0508-2/solo-dogfeeding/code/112-koel/app/Services/Scanners/ScannerCacheStrategy.php) 做内存级 LRU 缓存（默认 1000 条），避免重复查询艺术家/专辑。
 
@@ -662,7 +693,7 @@ iTunes API 调用使用 [Saloon](https://docs.saloon.dev/) HTTP 客户端封装�
 | 艺术家解析 | `resolveArtist()` 中缓存 Artist 实例 |
 | 专辑解析 | `resolveAlbum()` 中缓存 Album 实例 |
 
-#### 3.1.5 目录封面缓存
+#### 3.1.6 目录封面缓存
 
 | 缓存项 | TTL | 位置 |
 |--------|-----|------|
