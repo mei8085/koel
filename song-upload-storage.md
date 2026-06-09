@@ -474,40 +474,40 @@ if ($song->path !== $storageLocation || $song->storage !== $storage->getStorageT
 
 ### 云存储的临时文件生命周期
 
-云存储驱动都继承自 [CloudStorage](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Services/SongStorages/CloudStorage.php)，并实现了 `MustDeleteTemporaryLocalFileAfterUpload` 空接口。这个接口是一个"标记接口"，用于告知 UploadService 需要清理临时文件。
+云存储驱动都继承自 [CloudStorage](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Services/SongStorages/CloudStorage.php)，并实现了 `MustDeleteTemporaryLocalFileAfterUpload` 空接口。这个接口是一个"标记接口"，用于告知 UploadService 需要清理本地临时文件。
 
-**临时文件的完整生命周期：**
+**临时文件的完整生命周期（以 S3 为例）：**
 
 ```
 控制器阶段
    │
-   ├─ 上传文件 → artifact_path/tmp/{ULID}/song.mp3  （第一次暂存）
+   ├─ 上传文件 → artifact_path/tmp/{ULID}/song.mp3  （第一次暂存：PHP 上传临时文件）
    │
 存储阶段 (storeUploadedFile)
    │
-   ├─ 上传到云端
-   └─ 返回 UploadReference { localPath: 临时文件, location: s3://... }
+   ├─ 上传到云端 S3
+   └─ 返回 UploadReference { localPath: 本地临时文件, location: s3://... }
    │
 扫描入库阶段
    │
-   ├─ 用 localPath 扫描元数据
+   ├─ 用 localPath 扫描元数据（读本地临时文件）
    ├─ 第一次写入数据库（path = 临时文件路径，storage = LOCAL）
    └─ 第二次写入修正（path = s3://...，storage = S3）
    │
 清理阶段 (finally 块)
    │
    └─ storage instanceof MustDeleteTemporaryLocalFileAfterUpload
-       → File::delete($uploadReference->localPath)  ← 清理临时文件
+       → File::delete($uploadReference->localPath)  ← 删除本地临时文件
 ```
 
-**清理时机：** 在 `UploadService::handleUpload()` 的 `finally` 块中，确保无论成功失败都会执行清理（除了重复上传的特殊情况 —— 重复上传时文件被保留在 DuplicateUpload 记录中供后续决策）。
+**清理时机：** 在 `UploadService::handleUpload()` 的 `finally` 块中，**无论成功失败都会执行**。包括重复上传的情况 —— 重复上传时云端文件保留，但本地临时文件仍然会被清理（因为文件已经在云端了，本地副本不再需要）。
 
-**哪些驱动会清理临时文件：**
-- ✅ `S3CompatibleStorage`（继承 CloudStorage）
+**哪些驱动会清理本地临时文件：**
+- ✅ `S3CompatibleStorage`（继承 CloudStorage → 实现了标记接口）
 - ✅ `S3LambdaStorage`（继承 CloudStorage）
 - ✅ `DropboxStorage`（继承 CloudStorage）
-- ✅ `SftpStorage`（直接实现接口）
-- ❌ `LocalStorage`（文件就在最终位置，不需要清理）
+- ✅ `SftpStorage`（直接实现标记接口）
+- ❌ `LocalStorage`（文件就在最终位置，没有"临时"一说）
 
 ### storage 字段的类型转换
 
@@ -689,10 +689,27 @@ protected function storageMetadata(): Attribute
 
 ## 总结
 
-歌曲上传入库是一个典型的 **管道式流程**：文件经过层层处理（验证 → 存储 → 去重 → 解析 → 关联 → 写入），每一层都有明确的职责和边界。关键设计亮点包括：
+歌曲上传入库是一个典型的 **管道式流程**：文件经过层层处理（验证 → 存储 → 去重 → 解析 → 关联 → 写入），每一层都有明确的职责和边界。
 
-1. **存储驱动抽象** — 灵活支持本地、S3、Dropbox 等多种存储
-2. **值对象封装** — 扫描结果、配置等使用不可变对象传递
-3. **事务安全** — 出错时回滚文件存储
-4. **缓存优化** — 艺术家/专辑解析使用缓存，减少数据库查询
-5. **同步异步统一** — 同一 Job 可同步可异步，架构灵活
+### 存储→数据库衔接的核心设计
+
+最值得关注的是**"先存后扫 + 事后修正"**的两步写入模型：
+
+1. 先把文件存到最终位置（本地或云端）
+2. 用本地路径扫描元数据，创建歌曲记录（此时 path 是本地路径，storage 是 LOCAL）
+3. 检查并修正 path 和 storage 字段为真实存储位置和类型
+
+这种设计用一次额外的数据库写入，换取了：
+- 统一的扫描入口（永远读本地文件）
+- 干净的错误回滚（失败了直接删文件，不留数据库脏数据）
+- 本地和云存储共用同一套入库逻辑
+
+### 关键设计亮点
+
+1. **存储驱动抽象** — `SongStorage` 基类 + 多驱动实现，本地/S3/Dropbox/SFTP 灵活切换
+2. **值对象封装** — `ScanInformation`、`UploadReference`、`storage_metadata` 等使用不可变对象传递
+3. **标记接口模式** — `MustDeleteTemporaryLocalFileAfterUpload` 空接口标识是否需要清理临时文件
+4. **事务安全** — `try/catch/finally` 确保文件和数据库状态一致
+5. **缓存优化** — 艺术家/专辑解析使用缓存，减少数据库查询
+6. **同步异步统一** — 同一 Job 可同步可异步，调用方无感知
+7. **动态属性解析** — `storage_metadata` 根据 path 和 storage 动态计算，屏蔽存储差异
