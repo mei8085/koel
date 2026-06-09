@@ -210,6 +210,95 @@ public function handleUpload(string $filePath, User $uploader): Song
 - `keep()` — 保留（继续入库，删除重复记录）
 - `discard()` — 丢弃（删除文件和重复记录）
 
+### 待决重复上传的生命周期
+
+一条 `DuplicateUpload` 记录（待决重复上传）有三种终结方式：
+
+| 终结方式 | 触发者 | 操作 | 数据库记录 | 存储文件 |
+|---------|--------|------|-----------|----------|
+| 保留（keep） | 用户主动 | 扫描入库 | 转为 Song 记录后删除 | 保留（成为正式歌曲文件） |
+| 丢弃（discard） | 用户主动 | 直接删除 | 删除 | 删除 |
+| 自动清理 | 定时任务 | 超期丢弃 | 删除 | 删除 |
+
+#### 用户主动操作
+
+**保留入口**：
+- 单条：`POST /api/upload/duplicate-uploads/{id}` → [KeepDuplicateUploadController](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Http/Controllers/API/Upload/KeepDuplicateUploadController.php)
+- 全部：`POST /api/upload/duplicate-uploads` → [KeepAllDuplicateUploadsController](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Http/Controllers/API/Upload/KeepAllDuplicateUploadsController.php)
+
+保留时调用 `DuplicateUploadService::keep()`：
+1. 用 `$storage->getLocalPath($location)` 把文件取到本地
+2. 调用 `scanAndStore()` 正常扫描入库
+3. 云存储清理本地临时文件
+4. 删除 `DuplicateUpload` 记录
+5. 返回 `SongUploadResponse`（含歌曲和专辑信息）
+
+**丢弃入口**：
+- 单条：`DELETE /api/upload/duplicate-uploads/{id}` → [DiscardDuplicateUploadController](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Http/Controllers/API/Upload/DiscardDuplicateUploadController.php)
+- 全部：`DELETE /api/upload/duplicate-uploads` → [DiscardAllDuplicateUploadsController](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Http/Controllers/API/Upload/DiscardAllDuplicateUploadsController.php)
+
+丢弃时调用 `DuplicateUploadService::discard()`：
+1. 用 `location` + `storage` 构造 `SongFileInfo` 列表
+2. 分发 `DeleteSongFilesJob` 异步删除存储文件
+3. 立即删除 `DuplicateUpload` 记录
+4. 返回 `204 No Content`
+
+#### 自动清理（过期丢弃）
+
+**定时触发**：在 [routes/console.php](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/routes/console.php#L10-L10) 中配置为每天执行：
+
+```php
+Schedule::job(new RunCommandJob('koel:clean-up-duplicate-uploads'))->daily();
+```
+
+**清理命令**：[CleanUpDuplicateUploadsCommand](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Console/Commands/CleanUpDuplicateUploadsCommand.php)
+
+```
+php artisan koel:clean-up-duplicate-uploads {--days=7}
+```
+
+**过期规则**：
+- 默认 `--days=7` — 创建时间超过 7 天的待决重复上传视为过期
+- `--days` 必须是正整数，否则命令失败
+- 查询条件：`created_at < now()->subDays($days)`
+
+查询由 [DuplicateUploadRepository::getStaleUploads()](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Repositories/DuplicateUploadRepository.php#L20-L23) 实现。
+
+**复用 discard 逻辑**：
+
+自动清理**直接复用** `DuplicateUploadService::discard()` 方法，和用户主动丢弃走完全相同的代码路径：
+
+```php
+$staleUploads = $this->repository->getStaleUploads($days);
+$this->service->discard($staleUploads);
+```
+
+效果上，自动清理就像是"系统替用户执行了丢弃操作"。文件删除、记录删除的逻辑完全一致，确保不会因为清理路径不同而留下脏数据。
+
+#### 生命周期完整时间线
+
+```
+上传检测到重复
+    │
+    ├─ 创建 DuplicateUpload 记录
+    ├─ 文件保留在存储位置
+    └─ 返回 409 Conflict + DuplicateUploadResource
+    │
+    ▼
+  待决状态
+    │
+    ├─ 用户 POST keep → 扫描入库 → 删除记录 → 转为正式歌曲
+    │
+    ├─ 用户 DELETE discard → 删文件 + 删记录
+    │
+    └─ 7 天后定时任务 → 调用 discard() → 删文件 + 删记录
+```
+
+**设计要点**：
+- `discard()` 是公共出口 — 用户丢弃和自动清理都走它，保证行为一致
+- `keep()` 走上传的同一套扫描入库逻辑 — 与正常上传复用 `scanAndStore`
+- 待决记录只有终结（keep/discard/超时）三种出口，不会无限期存在
+
 ---
 
 ## 阶段六：元数据解析（扫描）
@@ -813,7 +902,7 @@ try {
 1. **存储驱动抽象** — `SongStorage` 基类 + 多驱动实现，本地/S3/Dropbox/SFTP 灵活切换
 2. **值对象封装** — `ScanInformation`、`UploadReference`、`storage_metadata` 等使用不可变对象传递
 3. **标记接口模式** — `MustDeleteTemporaryLocalFileAfterUpload` 空接口标识是否需要清理临时文件
-4. **事务安全** — `try/catch/finally` 确保文件和数据库状态一致
+4. **分层异常处理** — 重复上传不回滚、其他异常全量回滚、finally 确保临时文件清理
 5. **缓存优化** — 艺术家/专辑解析使用缓存，减少数据库查询
 6. **同步异步统一** — 同一 Job 可同步可异步，调用方无感知
 7. **动态属性解析** — `storage_metadata` 根据 path 和 storage 动态计算，屏蔽存储差异
