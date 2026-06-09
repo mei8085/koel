@@ -242,22 +242,22 @@ getSourceUrl: (playable: Playable) => {
 
 从 `?t=` 参数到解析为当前用户，完整链路涉及 Guard 驱动、Token 解析、权限验证三层核心环节。下面沿着 Laravel 框架层深入追踪各组件的实际调用路径与关联。
 
-#### 3.5.1 双 Guard 架构：配置与实际生效
+#### 3.5.1 双 Guard 架构：配置与路由上下文
 
-[config/auth.php](config/auth.php) 定义了两个认证 Guard，但**配置中的默认值 ≠ 实际生效的 Guard**。
+[config/auth.php](config/auth.php) 定义了两个认证 Guard，分别服务于 web 路由和 API 路由两种上下文。
 
 **配置文件定义**：
 
 ```php
 // config/auth.php
 'defaults' => [
-    'guard' => 'api',      // 配置中的默认 Guard
+    'guard' => 'api',      // 配置文件声明的默认 Guard
     'passwords' => 'users',
 ],
 
 'guards' => [
     'web' => [
-        'driver' => 'token-via-query-parameter',  // 自定义驱动
+        'driver' => 'token-via-query-parameter',  // 自定义 viaRequest 驱动
         'provider' => 'users',
     ],
     'api' => [
@@ -267,22 +267,22 @@ getSourceUrl: (playable: Playable) => {
 ],
 ```
 
-**实际生效规则**：
+**路由上下文与 Guard 的对应关系**：
 
-Laravel 的设计约定是「路由所在的中间件组决定默认 Guard」：
+在 Koel 中，web 路由使用 web Guard，api 路由使用 api Guard。这是由路由所在的中间件组上下文决定的：
 
-| 路由中间件组 | 实际默认 Guard | 驱动 | Token 提取方式 | 典型场景 |
-|-------------|--------------|------|---------------|----------|
+| 路由中间件组 | 实际使用的 Guard | 驱动 | Token 提取方式 | 典型场景 |
+|-------------|----------------|------|---------------|----------|
 | `web` 组 | `web` guard | `token-via-query-parameter` | 查询参数 `api_token` / `t` | 播放、下载、Last.fm 回调 |
 | `api` 组 | `api` guard | `sanctum` | `Authorization: Bearer` Header | 数据读写、状态同步 |
 
-> **验证依据**：[LastfmTest.php](tests/Feature/LastfmTest.php) 第 40 行 Mock `TokenManager::getUserFromPlainTextToken()` 被期望调用，证明 web 路由上自定义驱动确实参与了认证。
+> **验证依据**：[LastfmTest.php](tests/Feature/LastfmTest.php) 第 40 行 Mock `TokenManager::getUserFromPlainTextToken()` 被期望调用，证明 web 路由上的认证走的是 web Guard 的自定义驱动，而非默认配置中的 api Guard。
 
 **核心设计洞察**：
 - 两个 Guard 不是「两套独立认证体系」，而是「同一套 Token 存储 + 两种 Token 提取方式」
-- 两者底层都依赖 Sanctum 的 `PersonalAccessToken` 模型
-- 差异仅在于「从哪里提取 Token 字符串」，验证逻辑完全一致
-- 都能设置 `currentAccessToken`，因此都支持 `tokenCan()` 权限检查
+- 两者底层都依赖 Sanctum 的 `PersonalAccessToken` 模型进行 Token 验证和用户解析
+- 差异仅在于「从请求的哪里提取 Token 字符串」，Token 验证逻辑完全一致
+- 两种 Guard 认证后都能在 User 模型上设置 `currentAccessToken`，因此都支持 `tokenCan()` 权限检查
 
 #### 3.5.2 $request->user() 的框架层调用链
 
@@ -317,7 +317,7 @@ Illuminate\Http\Request::user($guard = null)
 
 1. **userResolver 的注入**：Laravel 在 `AuthServiceProvider` 中通过 `$request->setUserResolver()` 将用户解析器闭包注入到 Request 实例。
 
-2. **默认 Guard 的动态切换**：当请求进入 web 中间件组时，框架将默认 Guard 设置为 `web`；进入 api 中间件组时设置为 `api`。这解释了为什么同一段 `$request->user()` 代码在不同路由上行为不同。
+2. **路由上下文与默认 Guard 的对应关系**：在 Laravel 中，web 中间件组的路由默认使用 `web` Guard，api 中间件组的路由默认使用 `api` Guard。这是框架的约定对应关系，解释了为什么同一段 `$request->user()` 代码在不同路由上行为不同。
 
 3. **惰性求值**：`$request->user()` 采用惰性求值，首次调用时才执行认证逻辑，结果会被 Guard 缓存，后续调用直接返回缓存的用户。
 
@@ -495,7 +495,7 @@ GET /play/{song}?t=xxx
     │
     ▼
 web 中间件组（StartSession、CSRF、SubstituteBindings 等）
-    │  ← 此时默认 Guard 已切换为 web
+    │  ← web 路由上下文默认使用 web Guard
     ▼
 audio.auth 中间件（AudioAuthenticate::handle）
     │  ← 唯一的认证检查点
@@ -525,7 +525,7 @@ PlayController
 ┌─────────────────────────────────────────────────────┐
 │  2. web 中间件组执行                                │
 │     ├─ StartSession、VerifyCsrfToken 等            │
-│     └─ 默认 Guard 切换为 web                        │
+│     └─ web 路由上下文默认使用 web Guard            │
 └─────────────────────────────────────────────────────┘
                           │
                           ▼
