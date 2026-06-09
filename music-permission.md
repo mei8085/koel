@@ -1,22 +1,78 @@
-# 高级版公开歌曲权限规则分析
+# 音乐权限分析
 
-## 概述
+## 一、权限体系分层
 
-Koel 高级版（Plus License）的公开歌曲（`is_public = true`）在不同访问路径下遵循**两套不同的判定规则**，存在显著的权限差异。理解这些差异对于排查"用户为什么听不到这首歌"或"这首歌为什么出现在列表里"至关重要。
+Koel 的音乐访问权限分为四层，自上而下逐层拦截：
 
-两套核心判定逻辑分别是：
-- **模型方法 `Song::accessibleBy()`**：用于单曲授权（Policy 层）
-- **查询作用域 `SongBuilder::accessible()`**：用于列表查询（Repository 层）
+| 层级 | 机制 | 作用范围 | 失败表现 |
+|------|------|---------|---------|
+| L1 | 认证中间件 | 路由入口 | 401 Unauthorized |
+| L2 | Policy 授权 | 控制器方法（单对象） | 403 Forbidden |
+| L3 | 查询作用域 | Repository 列表查询 | 数据被静默过滤 |
+| L4 | 协作级联 | 播放列表协作时 | 主动变更歌曲属性 |
 
-两者在**组织隔离**、**用户偏好**等维度上规则不一致。
+许可证类型是核心分支条件：社区版（Community）所有歌曲全局可见，高级版（Plus）才有精细化的歌曲级访问控制。
 
 ---
 
-## 一、两套判定规则的详细对比
+## 二、第一层：认证中间件
 
-### 1.1 `Song::accessibleBy()` — 模型方法（单曲授权用）
+### 2.1 `auth` 中间件
 
-**文件**：[Song.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Models/Song.php#L132-L139)
+**类**：`App\Http\Middleware\Authenticate`
+
+用于 API 路由组，检查用户是否通过 Sanctum 认证且令牌拥有 `*` 能力。
+
+```php
+if ($request->user()?->tokenCan('*')) {
+    return $next($request);
+}
+```
+
+**适用路由**：所有 `api.base.php` 中 `Route::middleware('auth')` 分组内的接口，包括歌曲列表、播放列表 CRUD、收藏等。
+
+### 2.2 `audio.auth` 中间件
+
+**类**：`App\Http\Middleware\AudioAuthenticate`
+
+用于 Web 音频流路由组，检查令牌是否拥有 `audio` 能力。
+
+```php
+abort_unless($request->user()?->tokenCan('audio'), Response::HTTP_UNAUTHORIZED);
+```
+
+**适用路由**：
+- 歌曲播放流 `GET /play/{song}/{transcode?}`
+- 电台流 `GET /radio/stream/{radioStation}`
+- 下载接口（配置开启时）
+
+**两套中间件的区别**：API 数据操作需要 `*` 能力，音频流只需要 `audio` 能力，支持颁发仅可播放不可修改的受限令牌。
+
+### 2.3 `RestrictPlusFeatures` 中间件
+
+**类**：`App\Http\Middleware\RestrictPlusFeatures`
+
+全局附加在 `api` 和 `web` 中间件组上。检查控制器方法的 `#[RequiresPlus]` 注解，社区版下拒绝访问。
+
+---
+
+## 三、第二层：Policy 授权（单曲粒度）
+
+### 3.1 SongPolicy
+
+**类**：`App\Policies\SongPolicy`
+
+| 方法 | 社区版逻辑 | 高级版逻辑 |
+|------|-----------|-----------|
+| `access` | `true` | `$song->accessibleBy($user)` |
+| `own` | `$song->ownedBy($user)` | `$song->ownedBy($user)` |
+| `edit` | 需 `MANAGE_SONGS` 权限 | `$song->accessibleBy($user)` |
+| `delete` | 需 `MANAGE_SONGS` 权限 | `$song->ownedBy($user)` |
+| `download` | 同 `access` | 同 `access` |
+
+### 3.2 `Song::accessibleBy()` 方法
+
+**类**：`App\Models\Song`
 
 ```php
 public function accessibleBy(User $user): bool
@@ -29,215 +85,145 @@ public function accessibleBy(User $user): bool
 }
 ```
 
-**公开歌曲判定**：只要 `is_public = true` 就返回 `true`。
+**判定规则**（高级版，满足任一即可）：
+1. 播客剧集：用户已订阅该播客
+2. 普通歌曲：`is_public = true` 或 `ownedBy($user)`
 
-| 检查项 | 是否涉及 |
-|--------|---------|
-| 组织隔离（`organization_id`） | ❌ 不检查 |
-| 用户偏好（`includePublicMedia`） | ❌ 不检查 |
-| 歌曲所有者（`ownedBy`） | 只需满足任一 |
-| 播客订阅 | ✅ 播客剧集单独检查 |
+**注意**：`accessibleBy()` 方法不检查组织隔离，也不检查 `includePublicMedia` 用户偏好。公开歌曲对所有登录用户可见。
 
-**结论**：`accessibleBy()` 对公开歌曲是**全局放行**的，不限制组织。
-
----
-
-### 1.2 `SongBuilder::accessible()` — 查询作用域（列表查询用）
-
-**文件**：[SongBuilder.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Builders/SongBuilder.php#L66-L108)
+### 3.3 `Song::ownedBy()` 方法
 
 ```php
-public function accessible(): self
+public function ownedBy(User $user): bool
 {
-    if (License::isCommunity()) {
-        return $this;
-    }
-
-    // ... 播客剧集检查 ...
-
-    return $this->where(function (self $query): void {
-        $query
-            ->whereNotNull('songs.podcast_id')
-            ->orWhere(function (self $q2) {
-                if (!$this->user->preferences->includePublicMedia) {
-                    return $q2->whereBelongsTo($this->user, 'owner');
-                }
-
-                return $q2->where(function (self $q3): void {
-                    $q3->whereBelongsTo($this->user, 'owner')->orWhere(function (self $q4): void {
-                        $q4->where('songs.is_public', true)->whereHas('owner', fn (Builder $owner) => $owner->where(
-                            'organization_id',
-                            $this->user->organization_id,
-                        )->where('owner_id', '<>', $this->user->id));
-                    });
-                });
-            });
-    });
+    return $this->owner->id === $user->id;
 }
 ```
 
-**公开歌曲判定**：`is_public = true` **且** 所有者与当前用户同组织 **且** 不是自己的歌。
+### 3.4 歌曲编辑授权边界
 
-| 检查项 | 是否涉及 |
-|--------|---------|
-| 组织隔离（`organization_id`） | ✅ 严格限制同组织 |
-| 用户偏好（`includePublicMedia`） | ✅ 关闭则完全不显示公开歌曲 |
-| 歌曲所有者（`ownedBy`） | 单独的 OR 分支 |
-| 播客订阅 | ✅ 播客剧集单独检查 |
-| "排除自己" | ✅ 公开歌曲特指"他人的公开歌曲" |
+高级版下，`SongPolicy@edit` 的判定条件等于 `accessibleBy()`，即：
 
-**结论**：`accessible()` 对公开歌曲是**同组织内可见**，且受用户偏好开关控制。
+- 所有者可以编辑自己的歌曲
+- 任何公开歌曲也可以被编辑
+- 删除权限严格限制为所有者（`ownedBy`）
+
+### 3.5 PlaylistPolicy
+
+**类**：`App\Policies\PlaylistPolicy`
+
+| 方法 | 判定逻辑 |
+|------|---------|
+| `access` | `own() \|\| hasCollaborator()` |
+| `own` | `$playlist->ownedBy($user)` |
+| `edit` / `delete` | 仅所有者 |
+| `collaborate` | 所有者或协作者 |
+| `download` | 同 `access` |
+| `inviteCollaborators` | Plus 版 + 所有者 + 非智能播放列表 |
+
+### 3.6 播放列表归属与协作
+
+**类**：`App\Models\Playlist`
+
+```php
+public function ownedBy(User $user): bool
+{
+    return $this->owner->is($user);
+}
+```
+
+播放列表通过多对多关系 `users` 关联用户，`pivot.role` 区分 `owner` 和 `collaborator`。`owner` 属性通过 `users` 集合中 `role=owner` 的记录动态获取。
+
+**协作者判定**（`App\Models\Concerns\Playlists\ManagesCollaborators`）：
+
+```php
+public function hasCollaborator(User $collaborator): bool
+{
+    return $this->collaborators->contains($collaborator->is(...));
+}
+```
 
 ---
 
-### 1.3 规则差异对照表
+## 四、第三层：查询作用域（列表粒度）
 
-| 维度 | `Song::accessibleBy()`（模型方法） | `SongBuilder::accessible()`（查询作用域） |
-|------|-------------------------------------|-------------------------------------------|
-| 用途 | Policy 授权（单曲） | 列表查询（批量） |
-| 组织隔离 | ❌ 无 | ✅ 同组织内可见 |
-| `includePublicMedia` 偏好 | ❌ 不受影响 | ✅ 关闭则不显示公开歌 |
-| 自己的公开歌 | 算 `is_public` 为 true（但也匹配 ownedBy） | 不算在"公开歌曲"分支，走 `ownedBy` 分支 |
-| 跨组织公开歌曲 | ✅ 可访问 | ❌ 不可见 |
-| 调用方 | SongPolicy 的 access/edit/download | SongRepository 所有查询方法 |
+### 4.1 `SongBuilder::accessible()` 作用域
+
+**类**：`App\Builders\SongBuilder`
+
+社区版下直接返回，不过滤任何数据。高级版下应用以下过滤逻辑：
+
+**播客剧集**：必须属于用户已订阅的播客。
+
+**普通歌曲**：
+- 若 `$user->preferences->includePublicMedia = false`：仅返回用户自己拥有的歌曲
+- 若 `$user->preferences->includePublicMedia = true`：返回用户自己的歌曲 + 同组织其他用户的公开歌曲
+
+公开歌曲的 SQL 过滤条件：
+```sql
+songs.is_public = true
+AND owner.organization_id = user.organization_id
+AND songs.owner_id <> user.id
+```
+
+**关键差异**：`SongBuilder::accessible()` 比 `Song::accessibleBy()` 多了两层限制：
+1. 组织隔离：公开歌曲仅限同组织可见
+2. 用户偏好：`includePublicMedia` 关闭时不显示任何公开歌曲
+
+### 4.2 `withUserContext()` 标准查询入口
+
+```php
+public function withUserContext(
+    bool $includeFavoriteStatus = true,
+    bool $favoritesOnly = false,
+    bool $includePlayCount = true,
+): self {
+    return $this
+        ->accessible()
+        ->when($includeFavoriteStatus, ...)
+        ->when($includePlayCount, ...);
+}
+```
+
+`SongRepository` 的所有查询方法均通过 `withUserContext()` 执行，确保返回的歌曲在当前用户可见范围内。
+
+### 4.3 受影响的查询方法
+
+`App\Repositories\SongRepository` 中以下方法均应用 `accessible()` 过滤：
+
+- `paginate()` — 歌曲列表分页
+- `getOne()` — 单曲详情
+- `getMany()` — 批量获取（按 ID）
+- `getByAlbum()` — 专辑下的歌曲
+- `getByArtist()` — 艺术家下的歌曲
+- `getByPlaylist()` — 播放列表中的歌曲
+- `getFavorites()` — 收藏的歌曲
+- `getRecentlyPlayed()` / `getMostPlayed()` / `getLeastPlayed()` — 播放统计
+- `getByGenre()` — 流派下的歌曲
+- `search()` — 搜索结果
+- `getUnderPaths()` — 按文件夹路径获取
+
+### 4.4 播放列表可见性过滤
+
+**类**：`App\Repositories\PlaylistRepository`
+
+```php
+private function accessibleByUser(User $user): BelongsToMany
+{
+    return License::isCommunity() ? $user->ownedPlaylists() : $user->playlists();
+}
+```
+
+- 社区版：只列出用户自己拥有的播放列表
+- 高级版：列出用户关联的所有播放列表（拥有 + 协作）
 
 ---
 
-## 二、三条关键访问路径的拦截层分析
+## 五、第四层：协作播放列表与歌曲公开化
 
-### 2.1 路径一：单曲播放（PlayController）
+### 5.1 `makePlaylistContentPublic()` 方法
 
-**文件**：[PlayController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Http/Controllers/PlayController.php)
-
-**完整拦截链**：
-
-```
-GET /play/{song}/{transcode?}
-  ↓
-① audio.auth 中间件
-  [AudioAuthenticate.php]
-  检查：令牌有 `audio` 能力
-  失败 → 401
-  ↓
-② 路由模型绑定
-  直接通过 id 加载 Song，无权限过滤
-  ↓
-③ $this->authorize('access', $song)
-  → SongPolicy@access
-    → Song::accessibleBy($user)
-      → is_public || ownedBy
-  检查：无组织隔离，全局公开即可
-  失败 → 403
-  ↓
-④ Streamer 流式输出
-  [Streamer.php]
-  无额外权限检查
-```
-
-**关键拦截点**：第③步，使用 `Song::accessibleBy()`，**无组织隔离**。
-
-**实际影响**：
-- 如果知道其他组织的公开歌曲 ID，直接访问播放 URL 就可以播放
-- 播放接口不检查 `includePublicMedia` 用户偏好
-- Streamer 层纯技术实现，没有任何权限校验
-
----
-
-### 2.2 路径二：歌曲列表查询（SongController@index 等）
-
-**文件**：[SongController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Http/Controllers/API/SongController.php)
-
-**完整拦截链**（以歌曲列表为例）：
-
-```
-GET /api/songs
-  ↓
-① auth 中间件
-  [Authenticate.php]
-  检查：令牌有 `*` 能力
-  失败 → 401
-  ↓
-② SongController@index
-  → SongRepository::paginate(scopedUser: $user)
-    → Song::query(user: $user)->withUserContext()
-      → SongBuilder::accessible()
-        检查：
-        - includePublicMedia 关闭 → 仅自己的歌
-        - includePublicMedia 开启 → 自己的歌 + 同组织他人的公开歌
-      → SQL 层面 WHERE 过滤
-  结果：数据被静默过滤，不会有额外错误
-```
-
-**关键拦截点**：第②步，使用 `SongBuilder::accessible()`，**有严格的组织隔离**。
-
-**影响的查询方法**（全部走 `withUserContext()` → `accessible()`）：
-
-| Repository 方法 | 用途 |
-|-----------------|------|
-| `paginate()` | 歌曲列表分页 |
-| `getOne()` | 单曲详情 |
-| `getMany()` | 批量获取（按 ID） |
-| `getByAlbum()` | 专辑下的歌曲 |
-| `getByArtist()` | 艺术家下的歌曲 |
-| `getByPlaylist()` | 播放列表中的歌曲 |
-| `getFavorites()` | 收藏的歌曲 |
-| `getRecentlyPlayed()` / `getMostPlayed()` | 播放历史 |
-| `getByGenre()` | 流派下的歌曲 |
-| `search()` | 搜索结果 |
-
----
-
-### 2.3 路径三：播放列表歌曲加载（PlaylistSongController@index）
-
-这是最复杂的一条路径，有**两层拦截**：播放列表权限层 + 歌曲可见性层。
-
-**文件**：
-- [PlaylistSongController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Http/Controllers/API/PlaylistSongController.php)
-- [SongRepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Repositories/SongRepository.php#L199-L258)
-
-**完整拦截链**：
-
-```
-GET /api/playlists/{playlist}/songs
-  ↓
-① auth 中间件 → 401
-  ↓
-② 路由模型绑定 → 加载 Playlist
-  ↓
-③ 播放列表权限检查（第一层）
-  → $this->authorize('collaborate', $playlist)
-    → PlaylistPolicy@collaborate
-      → own() || hasCollaborator()
-  检查：用户是所有者或协作者
-  失败 → 403
-  ↓
-④ 歌曲可见性过滤（第二层）
-  → SongRepository::getByPlaylist($playlist, $user)
-    → Song::query(user: $user)->withUserContext()
-      → SongBuilder::accessible()
-        检查：组织隔离 + includePublicMedia 偏好
-  结果：不可见歌曲被静默过滤
-  ↓
-⑤ 返回歌曲列表
-```
-
-**两层拦截的分工**：
-- **第一层（PlaylistPolicy）**：确保用户能"碰"这个播放列表
-- **第二层（SongBuilder::accessible()）**：确保列表里的每首歌用户都能听到
-
-**关键问题：歌曲在播放列表里，但用户听不到？**
-
-可能的原因：
-1. 这首歌是私有的，且用户不是所有者
-2. 这首歌是公开的，但所有者与用户不在同一个组织
-3. 用户关闭了 `includePublicMedia` 偏好（即使同组织公开歌也不显示）
-4. 这是播客剧集，用户未订阅该播客
-
-**协作播放列表的特殊处理**：
-
-当播放列表有协作者时，系统会自动将列表中的歌曲设为公开：
-
-**文件**：[PlaylistService.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Services/Playlist/PlaylistService.php#L146-L149)
+**类**：`App\Services\Playlist\PlaylistService`
 
 ```php
 public function makePlaylistContentPublic(Playlist $playlist): void
@@ -246,153 +232,134 @@ public function makePlaylistContentPublic(Playlist $playlist): void
 }
 ```
 
-**触发时机**：
-1. 已有协作者的播放列表加入新歌曲时
-2. 新协作者加入播放列表时（通过 `NewPlaylistCollaboratorJoined` 事件）
+将播放列表中所有私有歌曲批量设为公开。
 
-但注意：`makePlaylistContentPublic` 只设置 `is_public = true`，并**不能保证跨组织可见**。如果协作者来自不同组织，即使歌曲设为公开，在列表查询时仍会被 `SongBuilder::accessible()` 的组织过滤排除。
+### 5.2 触发时机
 
----
+1. **添加歌曲时**：在 `addPlayablesToPlaylist()` 中，若播放列表已有协作者，则立即将新加入的歌曲设为公开。
 
-## 三、不一致性与边界情况
+2. **新协作者加入时**：通过 `NewPlaylistCollaboratorJoined` 事件触发 `MakePlaylistSongsPublic` 监听器，异步将播放列表内所有歌曲设为公开。
 
-### 3.1 跨组织公开歌曲：能播但搜不到
-
-这是最显著的不一致：
-
-| 操作 | 结果 | 原因 |
-|------|------|------|
-| 直接访问播放 URL `/play/{id}` | ✅ 可以播放 | 走 `accessibleBy()`，无组织过滤 |
-| 在歌曲列表中查看 | ❌ 看不到 | 走 `accessible()`，有组织过滤 |
-| 通过搜索查找 | ❌ 搜不到 | 走 `SongRepository::search()` → `accessible()` |
-| 在他人播放列表中看到 | ❌ 看不到 | 走 `getByPlaylist()` → `accessible()` |
-
-**安全提示**：如果已知歌曲 ID，跨组织用户可以直接播放公开歌曲。列表过滤只是"不可见"，不是"不可访问"。
-
-### 3.2 `includePublicMedia` 偏好只影响列表，不影响播放
-
-用户关闭"包含公开媒体"偏好后：
-- 歌曲列表里看不到别人的公开歌 ✅
-- 但直接访问播放 URL 仍然可以播放 ❌（因为 `accessibleBy()` 不检查这个偏好）
-
-### 3.3 歌曲详情接口的"双重检查"
-
-**文件**：[SongController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Http/Controllers/API/SongController.php#L40-L45)
+### 5.3 协作判定条件
 
 ```php
-public function show(Song $song)
+public function isPlaylistCollaborative(Playlist $playlist): bool
 {
-    $this->authorize('access', $song);       // 第一次检查：accessibleBy()，无组织过滤
-    return SongResource::make($this->songRepository->getOne($song->id, $this->user)); // 第二次：accessible()，有组织过滤
+    return once(
+        static fn () => !$playlist->is_smart && LicenseFacade::isPlus() && $playlist->collaborators->isNotEmpty(),
+    );
 }
 ```
 
-流程：
-1. 路由模型绑定加载 Song
-2. `authorize('access')` → `accessibleBy()` → 如果是跨组织公开歌，这里会通过
-3. `songRepository->getOne()` → `accessible()` → 组织过滤 → 如果跨组织，这里会 404
-
-**结果**：跨组织公开歌曲访问详情接口时返回 404（不是 403），因为第二次查询被过滤掉了。用户体验上可能困惑："我明明能播放，为什么详情页 404？"
-
-### 3.4 编辑/删除权限的跨组织问题
-
-SongPolicy 的 `edit` 和 `delete` 方法：
-
-- `edit`：高级版下走 `accessibleBy()` → 公开歌就能编辑？
-- `delete`：高级版下走 `ownedBy()` → 只有自己的歌能删
-
-等等，让我再确认一下 `edit` 的逻辑：
-
-```php
-public function edit(User $user, Song $song): bool
-{
-    return License::isCommunity() ? $user->hasPermissionTo(Permission::MANAGE_SONGS) : $song->accessibleBy($user);
-}
-```
-
-高级版下，`edit` 权限 = `accessibleBy()` = `is_public || ownedBy`。
-
-这意味着：**任何公开歌曲，任何人都可以编辑**？这似乎是一个设计问题。但实际执行时，编辑操作是对歌曲元数据的修改，通常只有所有者才有意义。需要结合业务逻辑进一步验证。
+需同时满足：非智能播放列表、Plus 许可证、至少有一个协作者。
 
 ---
 
-## 四、权限拦截汇总图
+## 六、三条关键路径的拦截流程
+
+### 6.1 路径一：单曲播放
+
+**入口**：`App\Http\Controllers\PlayController`
 
 ```
-                        ┌─────────────────────┐
-                        │   请求进入路由       │
-                        └─────────┬───────────┘
-                                  │
-                  ┌───────────────┴───────────────┐
-                  │                               │
-          ┌───────┴───────┐               ┌───────┴───────┐
-          │  API 路由      │               │  WEB 音频路由 │
-          │  auth 中间件   │               │ audio.auth 中 │
-          │  令牌 * 能力   │               │   间 令牌audio│
-          └───────┬───────┘               └───────┬───────┘
-                  │                               │
-          ┌───────┴───────┐               ┌───────┴───────┐
-          │ 控制器方法     │               │ PlayController│
-          │               │               │               │
-   单曲操作│ $this->authorize│        播放 │ authorize(     │
-          │ → SongPolicy   │               │   'access',   │
-          │ → accessibleBy │               │   $song)      │
-          │ (无组织过滤)   │               │ → accessibleBy│
-          └───────┬───────┘               │ (无组织过滤)   │
-                  │                        └───────┬───────┘
-          ┌───────┴───────┐                       │
-          │ 列表查询       │                       │
-          │ → Repository  │                       │
-          │ → withUser-   │                       │
-          │   Context()   │                       │
-          │ → accessible()│                       │
-          │ (有组织过滤)   │                       │
-          └───────────────┘                       │
-                                                  │
-                                          ┌───────┴───────┐
-                                          │   Streamer    │
-                                          │ (无权限检查)  │
-                                          └───────────────┘
+GET /play/{song}/{transcode?}
+  ↓
+① audio.auth 中间件
+   检查：令牌有 `audio` 能力
+   失败 → 401
+  ↓
+② 路由模型绑定加载 Song
+  ↓
+③ $this->authorize('access', $song)
+   → SongPolicy@access
+   → Song::accessibleBy()
+   检查：is_public || ownedBy（无组织隔离）
+   失败 → 403
+  ↓
+④ Streamer 流式输出（无额外权限检查）
 ```
+
+### 6.2 路径二：歌曲列表查询
+
+**入口**：`App\Http\Controllers\API\SongController@index`
+
+```
+GET /api/songs
+  ↓
+① auth 中间件
+   检查：令牌有 `*` 能力
+   失败 → 401
+  ↓
+② SongRepository::paginate(scopedUser: $user)
+   → Song::query(user: $user)->withUserContext()
+   → SongBuilder::accessible()
+   检查：组织隔离 + includePublicMedia 偏好
+   结果：SQL 层过滤，不可见数据不返回
+```
+
+### 6.3 路径三：播放列表歌曲加载
+
+**入口**：`App\Http\Controllers\API\PlaylistSongController@index`
+
+```
+GET /api/playlists/{playlist}/songs
+  ↓
+① auth 中间件 → 401
+  ↓
+② 路由模型绑定加载 Playlist
+  ↓
+③ 第一层：播放列表权限检查
+   智能播放列表 → authorize('own', $playlist)
+   普通播放列表 → authorize('collaborate', $playlist)
+   → PlaylistPolicy 检查用户角色
+   失败 → 403
+  ↓
+④ 第二层：歌曲可见性过滤
+   SongRepository::getByPlaylist($playlist, $user)
+   → Song::query(user: $user)->withUserContext()
+   → SongBuilder::accessible()
+   检查：组织隔离 + includePublicMedia 偏好
+   结果：不可见歌曲被静默过滤
+```
+
+**注**：播放列表权限和歌曲可见性是两层独立检查。用户能访问播放列表，不代表能听到列表中的每首歌。
 
 ---
 
-## 五、关键文件速查
+## 七、两套访问判定的差异汇总
 
-| 文件 | 作用 | 关键方法 |
-|------|------|---------|
-| [Song.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Models/Song.php) | 歌曲模型 | `accessibleBy()`, `ownedBy()` |
-| [SongBuilder.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Builders/SongBuilder.php) | 歌曲查询构造器 | `accessible()`, `withUserContext()` |
-| [SongPolicy.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Policies/SongPolicy.php) | 歌曲授权策略 | `access()`, `edit()`, `delete()`, `download()` |
-| [SongRepository.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Repositories/SongRepository.php) | 歌曲仓储 | `paginate()`, `getOne()`, `getByPlaylist()` 等 |
-| [PlaylistPolicy.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Policies/PlaylistPolicy.php) | 播放列表授权策略 | `access()`, `collaborate()`, `own()` |
-| [PlayController.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Http/Controllers/PlayController.php) | 播放控制器 | `__invoke()` → 唯一的歌曲播放入口 |
-| [Streamer.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Services/Streamer/Streamer.php) | 流播放器 | 纯技术实现，无权限检查 |
-| [PlaylistService.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Services/Playlist/PlaylistService.php) | 播放列表服务 | `makePlaylistContentPublic()` |
-| [Authenticate.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Http/Middleware/Authenticate.php) | API 认证中间件 | 检查 `*` 令牌能力 |
-| [AudioAuthenticate.php](file:///d:/fz/0508-2/solo-dogfeeding/code/114-koel/app/Http/Middleware/AudioAuthenticate.php) | 音频认证中间件 | 检查 `audio` 令牌能力 |
+| 对比维度 | `Song::accessibleBy()`（模型方法） | `SongBuilder::accessible()`（查询作用域） |
+|---------|-----------------------------------|-------------------------------------------|
+| 调用层 | Policy（单对象授权） | Repository（列表查询） |
+| 组织隔离 | 无 | 有（同组织内可见） |
+| `includePublicMedia` 偏好 | 不影响 | 影响（关闭则不显示公开歌） |
+| 跨组织公开歌曲 | 可访问 | 不可见 |
+| 播客剧集检查 | 有 | 有 |
+
+### 不一致性的具体表现
+
+1. **跨组织公开歌曲**：直接播放可听（走 `accessibleBy()`），但在歌曲列表、搜索结果、播放列表视图中不可见（走 `accessible()`）。
+
+2. **`includePublicMedia` 偏好**：仅影响列表展示，不影响单曲播放和详情接口的授权判断。
+
+3. **歌曲详情接口的双重检查**：`SongController@show` 先调用 `authorize('access', $song)`（`accessibleBy()`，无组织过滤），再调用 `songRepository->getOne()`（`accessible()`，有组织过滤）。跨组织公开歌曲在详情接口会因第二步查询返回 404。
 
 ---
 
-## 六、排查指南
+## 八、关键文件
 
-**问题：用户说他听不到某首歌**
-
-按以下顺序排查：
-
-1. **先确认许可证**：社区版所有歌都可见，如果是社区版听不到，问题不在权限层
-2. **检查播放列表权限**：用户是不是播放列表的所有者或协作者？
-3. **检查歌曲属性**：
-   - 这首歌是公开的还是私有的？
-   - 所有者是谁？和用户同组织吗？
-4. **检查用户偏好**：`includePublicMedia` 是否关闭了？
-5. **区分路径**：
-   - 直接播放 URL 能不能播？（走 `accessibleBy()`，无组织过滤）
-   - 列表里能不能看到？（走 `accessible()`，有组织过滤）
-6. **播客剧集特殊处理**：用户有没有订阅该播客？
-
-**常见"听不到"原因**：
-- 歌曲是私有歌曲，用户不是所有者 → 完全听不到
-- 歌曲是其他组织的公开歌 → 列表里看不到，但直接访问播放 URL 可以播（不一致性）
-- 用户关闭了"包含公开媒体" → 所有他人的公开歌都不出现在列表里
-- 协作播放列表里有跨组织协作者 → 歌曲虽然设为公开，但不同组织的协作者在列表里看不到
+| 文件 | 作用 |
+|------|------|
+| `app/Models/Song.php` | 歌曲模型，`accessibleBy()` / `ownedBy()` |
+| `app/Builders/SongBuilder.php` | 歌曲查询构造器，`accessible()` / `withUserContext()` |
+| `app/Policies/SongPolicy.php` | 歌曲授权策略 |
+| `app/Policies/PlaylistPolicy.php` | 播放列表授权策略 |
+| `app/Repositories/SongRepository.php` | 歌曲仓储，所有列表查询入口 |
+| `app/Repositories/PlaylistRepository.php` | 播放列表仓储 |
+| `app/Http/Controllers/PlayController.php` | 歌曲播放控制器 |
+| `app/Http/Controllers/API/SongController.php` | 歌曲 API 控制器 |
+| `app/Http/Controllers/API/PlaylistSongController.php` | 播放列表歌曲控制器 |
+| `app/Services/Playlist/PlaylistService.php` | 播放列表服务，`makePlaylistContentPublic()` |
+| `app/Http/Middleware/Authenticate.php` | API 认证中间件 |
+| `app/Http/Middleware/AudioAuthenticate.php` | 音频认证中间件 |
+| `app/Listeners/MakePlaylistSongsPublic.php` | 协作者加入事件监听器 |
