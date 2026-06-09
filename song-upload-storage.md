@@ -405,6 +405,190 @@ if ($config->extractFolderStructure) {
 
 ---
 
+## 深度解析：存储到数据库写入的衔接机制
+
+这是整个上传流程中最容易混淆的部分 —— 文件先被存储，然后用本地路径扫描入库，最后再"修正"数据库中的路径和存储类型。整个过程涉及两次路径、两次写入，以及本地与云存储的差异化处理。
+
+### 核心问题：为什么需要两条路径？
+
+扫描文件元数据需要**本地可读的文件路径**（getID3 要读文件），而数据库最终需要存的是**存储位置标识**（本地路径或云 URL）。对于本地存储，两者是同一个东西；但对于云存储，扫描用的是本地临时文件，入库时要改成云端位置。
+
+`scanAndStore` 方法接收两个路径参数：
+- `localFilePath` — 用于扫描元数据的本地路径
+- `storageLocation` — 最终存入数据库的存储位置
+
+### path 与 storage 字段的两次写入
+
+歌曲记录的写入不是一次性完成的，而是"先创建、后修正"的两步走：
+
+**第一次写入（createOrUpdateSongFromScan 内部）**
+
+`SongService::createOrUpdateSongFromScan()` 接收的是 `ScanInformation` 对象，其中 `path` 字段是扫描时的本地路径。
+
+```php
+// ScanInformation::fromGetId3Info() 中
+path: $path,   // $path 是传入的本地文件路径
+```
+
+创建歌曲时，`path` 就等于这个本地扫描路径，`storage` 字段没传，使用数据库默认值（NULL），经 [SongStorageCast](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Casts/SongStorageCast.php) 转换后为 `SongStorageType::LOCAL`。
+
+**第二次写入（scanAndStore 中的修正）**
+
+[ScansAndStoresSong::scanAndStore()](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Services/Concerns/ScansAndStoresSong.php#L30-L35) 在入库完成后，检查是否需要修正路径和存储类型：
+
+```php
+if ($song->path !== $storageLocation || $song->storage !== $storage->getStorageType()) {
+    $song->update([
+        'path' => $storageLocation,
+        'storage' => $storage->getStorageType(),
+    ]);
+}
+```
+
+只要路径或存储类型有一个对不上，就会执行第二次 update。
+
+### 本地存储 vs 云存储：两条路径的对比
+
+#### 本地存储（LocalStorage）
+
+| 阶段 | localFilePath | storageLocation | storage 字段 | 是否触发第二次写入 |
+|------|--------------|----------------|-------------|-------------------|
+| 存储后 | `/music/__KOEL_UPLOADS__$1__/song.mp3` | 同左 | - | - |
+| 第一次写入 | 存入 `path` 字段 | - | LOCAL（默认） | - |
+| 检查时 | `path == storageLocation` 相等 | - | `storage == LOCAL` 相等 | **否** |
+
+本地存储下，扫描路径和最终路径是同一个，storage 默认就是 LOCAL，所以第二次写入的条件不满足，**只有一次数据库写入**。
+
+#### 云存储（S3/Dropbox/SFTP 等）
+
+以 S3 为例：
+
+| 阶段 | localFilePath | storageLocation | storage 字段 | 是否触发第二次写入 |
+|------|--------------|----------------|-------------|-------------------|
+| 存储后 | `/tmp/01J..._song.mp3` | `s3://bucket/1__01J..._song.mp3` | - | - |
+| 第一次写入 | 存入 `path` 字段 | - | LOCAL（默认） | - |
+| 检查时 | `path != storageLocation` 不等 | - | `storage != S3` 不等 | **是** |
+| 修正后 | - | 存入 `path` 字段 | S3 | - |
+
+云存储下，路径和存储类型都对不上，**一定会执行第二次 update**。
+
+### 云存储的临时文件生命周期
+
+云存储驱动都继承自 [CloudStorage](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Services/SongStorages/CloudStorage.php)，并实现了 `MustDeleteTemporaryLocalFileAfterUpload` 空接口。这个接口是一个"标记接口"，用于告知 UploadService 需要清理临时文件。
+
+**临时文件的完整生命周期：**
+
+```
+控制器阶段
+   │
+   ├─ 上传文件 → artifact_path/tmp/{ULID}/song.mp3  （第一次暂存）
+   │
+存储阶段 (storeUploadedFile)
+   │
+   ├─ 上传到云端
+   └─ 返回 UploadReference { localPath: 临时文件, location: s3://... }
+   │
+扫描入库阶段
+   │
+   ├─ 用 localPath 扫描元数据
+   ├─ 第一次写入数据库（path = 临时文件路径，storage = LOCAL）
+   └─ 第二次写入修正（path = s3://...，storage = S3）
+   │
+清理阶段 (finally 块)
+   │
+   └─ storage instanceof MustDeleteTemporaryLocalFileAfterUpload
+       → File::delete($uploadReference->localPath)  ← 清理临时文件
+```
+
+**清理时机：** 在 `UploadService::handleUpload()` 的 `finally` 块中，确保无论成功失败都会执行清理（除了重复上传的特殊情况 —— 重复上传时文件被保留在 DuplicateUpload 记录中供后续决策）。
+
+**哪些驱动会清理临时文件：**
+- ✅ `S3CompatibleStorage`（继承 CloudStorage）
+- ✅ `S3LambdaStorage`（继承 CloudStorage）
+- ✅ `DropboxStorage`（继承 CloudStorage）
+- ✅ `SftpStorage`（直接实现接口）
+- ❌ `LocalStorage`（文件就在最终位置，不需要清理）
+
+### storage 字段的类型转换
+
+[SongStorageCast](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Casts/SongStorageCast.php) 是一个自定义 Cast，负责数据库值和 `SongStorageType` 枚举之间的转换：
+
+**读取时（get）：**
+- NULL 或空字符串 → `SongStorageType::LOCAL`
+- 其他值 → `SongStorageType::tryFrom($value)`，无效则 fallback 到 LOCAL
+
+**写入时（set）：**
+- 接收 `SongStorageType` 或字符串
+- 写入枚举的 `value` 属性（如 `"s3"`、`"dropbox"`）
+
+[SongStorageType](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Enums/SongStorageType.php) 枚举定义：
+
+| 枚举值 | 数据库值 | 说明 |
+|--------|---------|------|
+| `LOCAL` | `""`（空字符串） | 本地存储，默认值 |
+| `S3` | `"s3"` | S3 兼容存储 |
+| `S3_LAMBDA` | `"s3-lambda"` | S3 + Lambda 转码 |
+| `DROPBOX` | `"dropbox"` | Dropbox |
+| `SFTP` | `"sftp"` | SFTP |
+
+> **注意**：LOCAL 对应的数据库值是空字符串而非 `"local"`，这是为了兼容历史数据 —— 老版本歌曲没有 `storage` 字段，迁移时该字段为 NULL，通过 Cast 被解释为 LOCAL。
+
+### storage_metadata：动态计算的存储元数据
+
+`storage_metadata` 不是数据库字段，而是 [HasSongAttributes](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Models/Concerns/Songs/HasSongAttributes.php#L30-L58) 中定义的动态属性，根据 `path` 和 `storage` 实时解析：
+
+```php
+protected function storageMetadata(): Attribute
+{
+    return (new Attribute(get: function (): SongStorageMetadata {
+        switch ($this->storage) {
+            case SongStorageType::SFTP:
+                preg_match('/^sftp:\\/\\/(.*)/', $this->path, $matches);
+                return SftpMetadata::make($matches[1]);
+            case SongStorageType::S3:
+                preg_match('/^s3:\\/\\/([^\/]+)\\/(.+)/', $this->path, $matches);
+                return S3CompatibleMetadata::make($matches[1], $matches[2]);
+            // ... 其他类型
+            default:
+                return LocalMetadata::make($this->path);
+        }
+    }))->shouldCache();
+}
+```
+
+每种存储类型对应一个 metadata 类：
+- `LocalMetadata` — 封装本地路径
+- `S3CompatibleMetadata` / `S3LambdaMetadata` — 封装 bucket 和 key
+- `DropboxMetadata` — 封装 Dropbox 路径
+- `SftpMetadata` — 封装 SFTP 路径
+
+这些 metadata 类提供统一的 `getPath()` 等方法，屏蔽不同存储的路径格式差异。
+
+### 路径的三种格式与用途
+
+| 路径格式 | 示例 | 使用场景 |
+|---------|------|---------|
+| 本地绝对路径 | `/music/song.mp3` | 扫描元数据、文件操作 |
+| S3 协议路径 | `s3://bucket/key/song.mp3` | 数据库存储、内部标识 |
+| 预签名 URL | `https://bucket.s3.../key?signature` | 对外播放、临时访问 |
+
+从数据库到播放的路径转换链：
+```
+数据库 path (s3://...) → storage_metadata 解析 → getPresignedUrl() → 播放 URL
+```
+
+### 为什么不先扫描再存储？
+
+你可能会问：为什么不先扫描好元数据，再上传到云端，直接用正确的路径创建歌曲？这样就不用两次写入了。
+
+原因有两个：
+1. **重复检测需要先存文件** — 重复检测基于文件哈希，而文件已经在存储位置了才能比较（并且 DuplicateUpload 记录需要知道存储位置）
+2. **错误回滚的原子性** — 先存储后扫描，扫描失败时可以直接 `undoUpload()` 删除已存文件，回滚干净。如果先扫描再存储，扫描成功但存储失败时，数据库里可能留下脏数据
+
+"先存后扫 + 事后修正"的设计，本质上是用一次额外的数据库写入，换取了更清晰的错误边界和回滚语义。
+
+---
+
 ## 阶段八：数据库模型
 
 ### Song 模型
