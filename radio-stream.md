@@ -713,15 +713,13 @@ playbackManager.usePlayback('queue')
 
 ### 6.4 从队列切回电台：完整状态迁移
 
-从队列切回电台时，有一个巧妙的设计保证了 watcher 能正确触发：
+播放电台前，代码会先把当前电台设为 Stopped，再将目标电台设为 Playing。这个模式与队列播放保持一致。
 
 **关键代码**：[RadioPlaybackService.ts#L7-L16](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/services/RadioPlaybackService.ts#L7-L16)
 
 ```typescript
 public async play(station: RadioStation) {
-  // 先把当前电台设为 Stopped（即使就是同一个电台）
   use(radioStationStore.current, station => (station.playback_state = 'Stopped'))
-
   station.playback_state = 'Playing'
   ...
 }
@@ -757,17 +755,16 @@ playbackManager.usePlayback('radio')
     └─► radioPlayback.play(stationA)          ◄── 第三步：播放电台
           │
           ├─► radioStationStore.current 是电台A（Paused）
-          ├─► stationA.playback_state = Stopped  ◄── 先设为 Stopped
+          ├─► stationA.playback_state = Stopped  ◄── 先停止当前电台
           │     │
-          │     │  【关键点 2】此时：
-          │     │  - radioStationStore.current 变成 null（Stopped 不算）
-          │     │  - 电台 watcher 触发：station 是 null → 不赋值
+          │     │  【关键点 2】同步执行中，状态瞬间变成 null
+          │     │  - 但 watcher 是批处理的，不会立即触发
           │     │
-          ├─► stationA.playback_state = Playing  ◄── 再设为 Playing
+          ├─► stationA.playback_state = Playing  ◄── 再设为播放状态
           │     │
-          │     │  【关键点 3】此时：
-          │     │  - radioStationStore.current 又变回电台A
-          │     │  - 电台 watcher 触发：station 有值 → currentStreamable = stationA
+          │     │  【关键点 3】同步执行完毕，最终状态是电台A
+          │     │  - 引用没变，watcher 批处理后比较结果相同 → 不触发
+          │     │  - ⚠️ 这种情况下 currentStreamable 不会被电台 watcher 更新
           │     │
           ├─► 设置 media.src
           └─► media.play() + startPolling()
@@ -775,17 +772,150 @@ playbackManager.usePlayback('radio')
 最终状态：
   - 电台A Playing（radioStationStore.current = 电台A）
   - 歌曲X Stopped
-  - currentStreamable = 电台A ◄── 底部栏显示电台信息
+  - currentStreamable = 队列的新值（下一首 / undefined）⚠️
 ```
 
-**为什么要先 Stopped 再 Playing？**
-- 因为 Vue 的 watch 是**浅比较**（引用比较）
-- 如果电台对象引用没变，只是内部属性从 Paused → Playing，watcher 不会触发
-- 通过 Stopped → Playing 的两次切换，让 `radioStationStore.current` 经历 null → station 的引用变化，确保 watcher 触发
+> **重要修正**：之前的"先 Stopped 再 Playing 确保 watcher 触发"的说法是不准确的。
+> 由于 Vue watch 的批处理机制，同一 tick 内的连续状态变化只会比较**最终值**和**旧值**。
+> 如果初始和最终都是同一个电台对象（引用相同），即使中间经过了 null，watcher 也不会触发。
+> 详见下一节「Vue watch 批处理机制与状态切换分析」。
 
-这是一个**刻意为之的设计**，用来保证 currentStreamable 总能正确更新。
+### 6.5 Vue watch 批处理机制与状态切换分析
 
-### 6.5 轮询清理的时机
+这是最容易产生误解的核心点，需要结合 Vue 的响应式机制来理解。
+
+#### 6.5.1 Vue watch 的批处理与比较规则
+
+**关键规则**：
+
+1. **批处理**：Vue 的 watch 默认使用 lush: 'pre'，在同一个同步 tick 内发生的多次状态变化会被合并，只在下一个微任务阶段执行一次回调。
+2. **浅比较**：默认使用 === 比较新值和旧值，如果是同一个对象引用，即使内部属性变了，也认为值没变，不触发回调。
+3. **最终值比较**：批处理后比较的是**最终状态值**和**上一次回调时的旧值**，中间状态会被完全忽略。
+
+**关键代码**：[App.vue#L137-L149](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/App.vue#L137-L149)
+
+``typescript
+watch(
+  () => queueStore.current,
+  song => (currentStreamable.value = song),
+)
+
+watch(
+  () => radioStationStore.current,
+  station => {
+    if (station) {
+      currentStreamable.value = station
+    }
+  },
+)
+``
+
+两个 watcher 的 source 都是 getter 函数。每次 getter 执行时，会访问响应式数据（state.stations 数组和每个 station 的 playback_state 属性），Vue 会收集这些依赖。当依赖变化时，watcher 被标记为 dirty，在下一个 tick 重新执行 getter 获取新值。
+
+#### 6.5.2 三种场景下的 watcher 触发分析
+
+我们分别分析三种典型场景下，
+adioStationStore.current 的 watcher 是否会触发。
+
+---
+
+**场景一：切换电台（stationA  stationB）**
+
+``
+初始值：stationA (Playing)
+  
+stationA.playback_state = 'Stopped'
+   current 瞬时 = null     （中间状态，被批处理忽略）
+  
+stationB.playback_state = 'Playing'
+   current 最终 = stationB
+  
+微任务阶段执行 watcher：
+  新值 = stationB
+  旧值 = stationA
+  比较：stationB !== stationA    触发 
+``
+
+**结论**： **会触发**。引用变了，新旧值不同。
+
+---
+
+**场景二：首次播放电台（null  stationA）**
+
+``
+初始值：null（没有非 Stopped 的电台）
+  
+stationA.playback_state = 'Playing'
+   current 最终 = stationA
+  
+微任务阶段执行 watcher：
+  新值 = stationA
+  旧值 = null
+  比较：stationA !== null    触发 
+``
+
+**结论**： **会触发**。从 null 到对象，引用变了。
+
+---
+
+**场景三：恢复播放同一电台（Paused  Playing）**
+
+``
+初始值：stationA (Paused)   （Paused  Stopped，所以 current 是 stationA）
+  
+stationA.playback_state = 'Stopped'
+   current 瞬时 = null     （中间状态，被批处理忽略）
+  
+stationA.playback_state = 'Playing'
+   current 最终 = stationA  （还是同一个对象引用）
+  
+微任务阶段执行 watcher：
+  新值 = stationA
+  旧值 = stationA（上一次回调时缓存的值）
+  比较：stationA === stationA    不触发 
+``
+
+**结论**： **不会触发**。初始和最终是同一个对象引用，浅比较认为值没变。
+
+> **重要**：即使中间经历了 
+ull，由于批处理机制，中间状态会被丢弃，只比较首尾。
+#### 6.5.3 "先 Stopped 再 Playing"的真正目的
+
+既然"先 Stopped 再 Playing"不能确保 watcher 触发（场景三下无效），那为什么代码要这么写？
+
+**真正的目的**：
+
+1. **统一的播放前清理模式**：这是队列播放和电台播放共用的模式  播放新内容前，先把当前正在播放 / 暂停的内容设为 Stopped，保证任何时刻只有一个"当前项"。
+
+   **关键代码**：[QueuePlaybackService.ts#L113-L117](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/services/QueuePlaybackService.ts#L113-L117)
+   ``typescript
+   if (queueStore.current) {
+     queueStore.current.playback_state = 'Stopped'
+   }
+   playable.playback_state = 'Playing'
+   ``
+
+   电台播放也是完全一样的模式：
+   **关键代码**：[RadioPlaybackService.ts#L7-L10](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/services/RadioPlaybackService.ts#L7-L10)
+   ``typescript
+   public async play(station: RadioStation) {
+     use(radioStationStore.current, station => (station.playback_state = 'Stopped'))
+     station.playback_state = 'Playing'
+   ``
+
+2. **切换电台时能正确工作**：在切换电台（场景一）和首次播放（场景二）时，这个模式确实能让 watcher 正确触发。只有恢复同一电台（场景三）时不触发。
+
+3. **副作用可接受**：场景三下 watcher 不触发通常不构成问题，因为：
+   - 如果用户一直在电台页面暂停 / 播放，currentStreamable 本来就是电台
+   - 如果用户从队列切回电台，见下一节的分析
+
+#### 6.5.4 从队列切回电台时的显示问题
+
+这是最容易出问题的边界场景：电台A 暂停中  切到队列播放歌曲X  又切回电台A。
+
+**关键分析**：
+
+### 6.6 轮询清理的时机
 
 轮询（polling）的启动和停止是对称的：
 
@@ -818,7 +948,7 @@ stopPolling() {
 - 只要电台进入 Paused 状态（无论是主动暂停还是被 deactivate），**轮询立即停止，元数据立即清空**
 - 所以暂停电台后，底部栏的"正在播放"行会从歌曲名切换回电台描述
 
-### 6.6 底部播放栏的显示逻辑
+### 6.7 底部播放栏的显示逻辑
 
 底部播放栏通过 `currentStreamable` 统一渲染，但内部会根据类型分流：
 
@@ -862,7 +992,7 @@ const toggle = async () => {
 - 如果显示的是歌曲，点暂停 / 播放走的是 QueuePlaybackService
 - 不会出现"显示着电台但用队列服务播放"的错乱
 
-### 6.7 容易误解点速查表
+### 6.8 容易误解点速查表
 
 | 问题 | 答案 | 原因 |
 |------|------|------|
@@ -891,7 +1021,7 @@ const toggle = async () => {
 
 ---
 
-## 七、相关文件索引
+## 八、相关文件索引
 
 | 模块 | 文件路径 |
 |------|----------|
