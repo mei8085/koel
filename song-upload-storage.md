@@ -577,15 +577,122 @@ protected function storageMetadata(): Attribute
 数据库 path (s3://...) → storage_metadata 解析 → getPresignedUrl() → 播放 URL
 ```
 
-### 为什么不先扫描再存储？
+### 先存后扫的设计依据：对照代码的事实分析
 
-你可能会问：为什么不先扫描好元数据，再上传到云端，直接用正确的路径创建歌曲？这样就不用两次写入了。
+常被问到：为什么不先扫描检测重复，再存到最终位置？这样数据库就不用写两次了。下面对照代码逐一澄清。
 
-原因有两个：
-1. **重复检测需要先存文件** — 重复检测基于文件哈希，而文件已经在存储位置了才能比较（并且 DuplicateUpload 记录需要知道存储位置）
-2. **错误回滚的原子性** — 先存储后扫描，扫描失败时可以直接 `undoUpload()` 删除已存文件，回滚干净。如果先扫描再存储，扫描成功但存储失败时，数据库里可能留下脏数据
+#### 事实 1：哈希计算不需要先存文件
 
-"先存后扫 + 事后修正"的设计，本质上是用一次额外的数据库写入，换取了更清晰的错误边界和回滚语义。
+[DuplicateUploadService::detectDuplicate()](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Services/Upload/DuplicateUploadService.php#L38-L59) 接收的第一个参数是 `$filePath`，调用方传的是 `$uploadReference->localPath`：
+
+```php
+// UploadService::handleUpload() 中
+$this->duplicateUploadService->detectDuplicate(
+    $uploadReference->localPath,  // ← 本地文件路径
+    $uploadReference,
+    $uploader
+);
+```
+
+```php
+// detectDuplicate() 内部
+$existingSong = $this->songRepository->findByHash(
+    File::hash($filePath),  // ← 读本地文件算哈希
+    $uploader
+);
+```
+
+`File::hash()` 只需要文件内容可读，跟文件在不在最终存储位置没有关系。**重复检测本身不需要先存文件。**
+
+#### 事实 2：DuplicateUpload 记录的 location 必须指向持久化文件
+
+检测到重复后，创建 [DuplicateUpload](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Models/DuplicateUpload.php) 记录时存的是 `$uploadReference->location`（最终存储位置）：
+
+```php
+DuplicateUpload::query()->create([
+    'user_id' => $uploader->id,
+    'existing_song_id' => $existingSong->id,
+    'location' => $uploadReference->location,  // ← 最终存储位置
+    'storage' => $this->storage->getStorageType(),
+]);
+```
+
+这个 `location` 字段后续要派上用场：
+
+**保留（keep）入口**：[KeepDuplicateUploadController](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Http/Controllers/API/Upload/KeepDuplicateUploadController.php) → POST `/api/upload/duplicate-uploads/{id}`
+
+```php
+// DuplicateUploadService::keep() 中
+$localFilePath = $this->storage->getLocalPath($upload->location);
+$songs->add($this->scanAndStore($localFilePath, $upload->location, ...));
+```
+
+保留时，用 `location` 把文件取到本地（云存储是从云端下载），然后正常扫描入库。
+
+**丢弃（discard）入口**：[DiscardDuplicateUploadController](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Http/Controllers/API/Upload/DiscardDuplicateUploadController.php) → DELETE `/api/upload/duplicate-uploads/{id}`
+
+```php
+// DuplicateUploadService::discard() 中
+$songFiles = $uploads->map(static fn (DuplicateUpload $upload) => SongFileInfo::make(
+    $upload->location,
+    $upload->storage,
+));
+Dispatcher::dispatch(new DeleteSongFilesJob($songFiles));
+```
+
+丢弃时，用 `location` + `storage` 定位文件并删除。
+
+**关键结论**：因为 DuplicateUpload 支持**延迟决策**（用户可以过一会儿再决定保留还是丢弃），所以文件必须已经存在于**持久化存储**中，不能是随时会被清理的临时文件。这是"先存后扫"的根本原因 —— 不是为了检测重复，而是为了**重复检测后的文件能被后续的 keep/discard 操作引用**。
+
+#### 事实 3：失败回滚与临时文件清理是两条独立逻辑
+
+[UploadService::handleUpload()](file:///d:/fz/0508-2/solo-dogfeeding/code/113-koel/app/Services/Upload/UploadService.php#L28-L54) 的异常处理结构：
+
+```php
+try {
+    $this->duplicateUploadService->detectDuplicate(...);
+    return $this->scanAndStore(...);
+} catch (DuplicateSongUploadException $e) {
+    throw $e;                     // 重复上传：不回滚，文件保留
+} catch (Throwable $error) {
+    $this->storage->undoUpload($uploadReference);  // 其他失败：回滚存储
+    throw SongUploadFailedException::make($error);
+} finally {
+    if ($this->storage instanceof MustDeleteTemporaryLocalFileAfterUpload) {
+        File::delete($uploadReference->localPath);  // 云存储：总是清理本地临时文件
+    }
+}
+```
+
+**三条路径的行为：**
+
+| 场景 | 存储文件（云端/最终位置） | 本地临时文件（云存储） | 数据库 |
+|------|------------------------|----------------------|--------|
+| ✅ 成功 | 保留 | finally 删除 | 歌曲记录 |
+| ⚠️ 重复上传 | **保留** | finally 删除 | DuplicateUpload 记录 |
+| ❌ 其他失败 | undoUpload 删除 | undoUpload 先删 + finally 再删（幂等） | 无 |
+
+几个容易混淆的点：
+- **回滚（undoUpload）删的是存储文件**，不是数据库记录（因为还没写）
+- **临时文件清理（finally）删的是本地副本**，只对云存储有意义
+- 重复上传时，存储文件**故意不删**，留给后续 keep/discard 用
+- `File::delete()` 是幂等的，删过的文件再删一次不会报错
+
+#### 事实 4：两次写入数据库是复用现有逻辑的结果
+
+扫描入库的核心逻辑 `createOrUpdateSongFromScan` 是为本地媒体库扫描设计的，输入就是文件路径。上传场景为了复用这套逻辑，先传本地路径创建歌曲，然后再修正 `path` 和 `storage` 字段。
+
+这不是一个"用一次额外数据库写入换 XX"的主动设计选择，而是**复用已有扫描逻辑**的自然结果。扫描逻辑只认文件路径，存储是上传场景的额外关注点，两者通过 `scanAndStore` 中的事后修正粘合在一起。
+
+#### 小结：先存后扫的真正原因
+
+综合代码事实，"先存后扫"的设计由三个因素共同决定：
+
+1. **DuplicateUpload 延迟决策机制要求** — 文件必须先持久化，后续 keep/discard 才能引用
+2. **代码复用** — 复用已有的 `createOrUpdateSongFromScan` 扫描入库逻辑，通过事后修正 path/storage 适配上传场景
+3. **回滚简单性** — 先存后扫，失败时只需要删文件，不需要回滚数据库（因为还没写）
+
+其中第 1 点是功能性要求（没有它 DuplicateUpload 机制就无法工作），第 2、3 点是结构性收益。
 
 ---
 
@@ -699,10 +806,7 @@ protected function storageMetadata(): Attribute
 2. 用本地路径扫描元数据，创建歌曲记录（此时 path 是本地路径，storage 是 LOCAL）
 3. 检查并修正 path 和 storage 字段为真实存储位置和类型
 
-这种设计用一次额外的数据库写入，换取了：
-- 统一的扫描入口（永远读本地文件）
-- 干净的错误回滚（失败了直接删文件，不留数据库脏数据）
-- 本地和云存储共用同一套入库逻辑
+这种设计用一次额外的数据库写入，换取了重复上传场景下更好的用户体验。
 
 ### 关键设计亮点
 
