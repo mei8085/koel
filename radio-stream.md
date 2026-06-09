@@ -301,8 +301,8 @@ const toggle = async () => {
 
 ```typescript
 public async play(station: RadioStation) {
-  // 标记上一个电台为停止状态
-  use(radioStationStore.current, station => (station.playback_state = 'Stopped'))
+1. `radioStationStore.current` = 第一个 playback_state !== 'Stopped' 的电台，否则 null
+
 
   station.playback_state = 'Playing'
   this.media.src = radioStationStore.getSourceUrl(station)
@@ -788,13 +788,13 @@ playbackManager.usePlayback('radio')
 
 **关键规则**：
 
-1. **批处理**：Vue 的 watch 默认使用 lush: 'pre'，在同一个同步 tick 内发生的多次状态变化会被合并，只在下一个微任务阶段执行一次回调。
+1. **批处理**：Vue 的 watch 默认使用 `flush: 'pre'`，在同一个同步 tick 内发生的多次状态变化会被合并，只在下一个微任务阶段执行一次回调。
 2. **浅比较**：默认使用 === 比较新值和旧值，如果是同一个对象引用，即使内部属性变了，也认为值没变，不触发回调。
 3. **最终值比较**：批处理后比较的是**最终状态值**和**上一次回调时的旧值**，中间状态会被完全忽略。
 
 **关键代码**：[App.vue#L137-L149](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/App.vue#L137-L149)
 
-``typescript
+```typescript
 watch(
   () => queueStore.current,
   song => (currentStreamable.value = song),
@@ -808,20 +808,18 @@ watch(
     }
   },
 )
-``
-
+```
 两个 watcher 的 source 都是 getter 函数。每次 getter 执行时，会访问响应式数据（state.stations 数组和每个 station 的 playback_state 属性），Vue 会收集这些依赖。当依赖变化时，watcher 被标记为 dirty，在下一个 tick 重新执行 getter 获取新值。
 
 #### 6.5.2 三种场景下的 watcher 触发分析
 
-我们分别分析三种典型场景下，
-adioStationStore.current 的 watcher 是否会触发。
+我们分别分析三种典型场景下，`radioStationStore.current` 的 watcher 是否会触发。
 
 ---
 
 **场景一：切换电台（stationA  stationB）**
 
-``
+```
 初始值：stationA (Playing)
   
 stationA.playback_state = 'Stopped'
@@ -833,16 +831,15 @@ stationB.playback_state = 'Playing'
 微任务阶段执行 watcher：
   新值 = stationB
   旧值 = stationA
-  比较：stationB !== stationA    触发 
-``
-
+  比较：stationB !== stationA      触发 
+```
 **结论**： **会触发**。引用变了，新旧值不同。
 
 ---
 
 **场景二：首次播放电台（null  stationA）**
 
-``
+```
 初始值：null（没有非 Stopped 的电台）
   
 stationA.playback_state = 'Playing'
@@ -851,16 +848,15 @@ stationA.playback_state = 'Playing'
 微任务阶段执行 watcher：
   新值 = stationA
   旧值 = null
-  比较：stationA !== null    触发 
-``
-
+  比较：stationA !== null      触发 
+```
 **结论**： **会触发**。从 null 到对象，引用变了。
 
 ---
 
 **场景三：恢复播放同一电台（Paused  Playing）**
 
-``
+```
 初始值：stationA (Paused)   （Paused  Stopped，所以 current 是 stationA）
   
 stationA.playback_state = 'Stopped'
@@ -873,8 +869,7 @@ stationA.playback_state = 'Playing'
   新值 = stationA
   旧值 = stationA（上一次回调时缓存的值）
   比较：stationA === stationA    不触发 
-``
-
+```
 **结论**： **不会触发**。初始和最终是同一个对象引用，浅比较认为值没变。
 
 > **重要**：即使中间经历了 
@@ -992,7 +987,46 @@ const toggle = async () => {
 - 如果显示的是歌曲，点暂停 / 播放走的是 QueuePlaybackService
 - 不会出现"显示着电台但用队列服务播放"的错乱
 
-### 6.8 容易误解点速查表
+
+### 6.8 播放状态与 currentStreamable 对应关系表
+
+为了便于复核，下表列出了电台和队列各种状态组合下，currentStreamable 的最终值。
+
+**判定规则（可复核）：**
+
+1. 
+adioStationStore.current = 第一个 playback_state !== 'Stopped' 的电台，否则 null
+2. queueStore.current = 第一个 playback_state !== 'Stopped' 的歌曲，否则 fallback 查找
+3. 队列 watcher 先创建，无条件赋值；电台 watcher 后创建，仅当 station 为真值时覆盖
+4. 同一 tick 内的状态变化被 Vue 批处理，watcher 只比较最终值与上一次回调的旧值
+5. 同引用对象的属性变化不触发 watcher（浅比较）
+
+**状态对应关系表：**
+
+| # | 电台状态 | 队列状态 | radioStationStore.current | queueStore.current | currentStreamable | 底部栏显示 | 说明 |
+|---|---------|---------|---------------------------|-------------------|-------------------|-----------|------|
+| 1 | Stopped | Stopped | null | null / fallback | null / fallback | 空/上次歌曲 | 都没在播放 |
+| 2 | Playing | Stopped | stationA | null | stationA | 电台信息 | 只有电台在播 |
+| 3 | Paused | Stopped | stationA | null | stationA | 电台信息（暂停） | Paused  Stopped，电台仍是 current |
+| 4 | Stopped | Playing | null | songX | songX | 歌曲信息 | 只有队列在播 |
+| 5 | Stopped | Paused | null | songX | songX | 歌曲信息（暂停） | 队列 Paused 也算 current |
+| 6 | Playing | Paused | stationA | songX | stationA | 电台信息 | 两者都有状态，电台 watcher 后执行覆盖 |
+| 7 | Paused | Playing | stationA | songX | songX | 歌曲信息 | 队列状态后变化，队列 watcher 后触发；电台 watcher 因同引用不触发 |
+| 8 | Paused | Paused | stationA | songX | 取决于谁最后触发 | 最后变化的那个 | 两者都 Paused，显示最后一次状态变化对应的内容 |
+
+**关键边界场景复核：**
+
+| 场景 | 行为 | 是否符合预期 |
+|------|------|-------------|
+| 电台播放中  暂停 | 底部栏仍显示电台 |  是 |
+| 电台暂停  切到队列播放 | 底部栏变成歌曲 |  是 |
+| 队列播放  切回同一暂停电台 | 底部栏可能还显示歌曲 |  边界情况（同引用 watcher 不触发） |
+| 队列播放  切到不同电台 | 底部栏变成电台 |  是 |
+| 电台播放  切到队列 | 底部栏变成歌曲 |  是 |
+| 电台停止  队列有歌曲 | 自动回落显示歌曲 |  是（有条件覆盖设计） |
+
+---
+### 6.9 容易误解点速查表
 
 | 问题 | 答案 | 原因 |
 |------|------|------|
@@ -1003,7 +1037,9 @@ const toggle = async () => {
 | 为什么电台暂停了还显示歌曲？ | 因为你切到了队列播放，底部栏显示的是队列的 current | 两个体系各有 current，最终显示哪个由 watcher 触发顺序和优先级决定 |
 | 电台暂停后轮询还在吗？ | **不在了** | pause() 里调用了 stopPolling() |
 | 电台暂停后还显示歌曲名吗？ | **不显示** | stopPolling() 把 nowPlaying 清空了，显示电台描述 |
-| 为什么 play() 要先设 Stopped？ | 为了触发 watcher 的引用变化 | Vue watch 是浅比较，同对象改属性不触发，得经历 null→station 才行 |
+| 为什么 play() 要先设 Stopped？ | 统一播放前清理，停止其他电台 | 与队列播放模式一致；切换电台时引用变化触发 watcher，但同一电台恢复时不触发（批处理+浅比较） |
+| 同一电台 Paused→Playing，watcher 触发吗？ | **不触发** | 同一个对象引用，Vue 批处理后浅比较相等 |
+| 从队列切回同一暂停电台，显示正确吗？ | **不一定** | 电台 watcher 可能不触发，底部栏可能停留在队列内容 |
 | 电台和队列都有 Paused 的项，显示谁？ | 取决于谁的 watcher 最后一次触发 | 通常是后发生状态变化的那个；电台 watcher 只有有值时才覆盖 |
 
 ---
