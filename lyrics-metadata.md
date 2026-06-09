@@ -5,7 +5,7 @@
 Koel 的歌词获取与元数据整合走两条相对独立但又有协作的链路：
 - **歌词链路**：以本地文件内嵌标签和 .lrc 外部文件为主要来源，辅以 AI 工具和人工编辑
 - **元数据链路**：以 Last.fm / MusicBrainz 等第三方百科服务为主要来源，获取专辑/艺术家的 Wiki 摘要、封面、曲目列表等信息
-- **补充链路**：Spotify 封面补充、iTunes 曲目链接等独立的第三方集成
+- **补充链路**：Spotify 封面来源、iTunes 曲目链接等独立的第三方集成
 
 ## 一、歌词获取链路
 
@@ -162,9 +162,9 @@ MusicBrainz 本身不提供 Wiki 文本，需要通过 **Pipeline 管道模式**
 - [WikidataConnector.php]
 - [WikipediaConnector.php]
 
-#### 2.2.3 Spotify 封面补充（逐段代码分析）
+#### 2.2.3 Spotify 封面来源（逐段代码分析）
 
-Spotify 不作为主百科服务，而是作为**封面图片的补充来源**。以下是从前端触发到本地存储的完整代码走向。
+Spotify 不提供完整的百科信息（Wiki 摘要、曲目列表等），只提供封面图片搜索。当 Spotify 启用时，它是封面的**优先来源**，百科封面作为 fallback。以下是从前端触发到本地存储的完整代码走向。
 
 ##### 2.2.3.1 启用条件
 
@@ -321,7 +321,7 @@ private function fetchAndStoreAlbumCover(Album $album, AlbumInformation $info): 
 
 **分支 A：Spotify 已启用**
 
-- **优先调用 Spotify 搜索封面（主来源）
+- 优先调用 Spotify 搜索封面（主来源）
 - 如果 Spotify 搜到了 → 下载到本地存储，更新数据库 `albums.cover`，返回本地 URL
 - 如果 Spotify 没搜到 → 返回 null，然后通过 `?? $info->cover` fallback 到百科封面（远程 URL，不下载到本地）
 
@@ -329,7 +329,7 @@ private function fetchAndStoreAlbumCover(Album $album, AlbumInformation $info): 
 
 - 直接使用百科返回的封面作为来源
 - 如果百科有封面 → 下载到本地存储，更新数据库，返回本地 URL
-- 如果百科没封面 → 返回 null，`$info->cover 保持为空
+- 如果百科没封面 → 返回 null，`$info->cover` 保持为空
 
 **重要差异**：当 Spotify 启用但搜索失败时，fallback 到的百科封面不会被下载到本地存储，只作为远程 URL 返回；而当 Spotify 未启用时，百科封面会被下载到本地。
 
@@ -527,7 +527,7 @@ public function __invoke(
 ```
 
 鉴权方式：
-- 不使用 Laravel 默认的 `auth` 中间件
+- 路由层使用 `auth` 中间件（Session 认证），控制器层再手动验证 `api_token`（Sanctum 认证），形成双重鉴权
 - 手动使用 `TokenManager::getUserFromPlainTextToken()` 验证 `api_token`
 - 底层调用 `PersonalAccessToken::findToken()`，即 Laravel Sanctum
 
@@ -633,9 +633,12 @@ iTunes API 调用使用 [Saloon](https://docs.saloon.dev/) HTTP 客户端封装�
 
 1. **缓存读取**：优先从 Laravel Cache 读取
 2. **主数据源调用**：调用绑定的 Encyclopedia 实现（Last.fm 或 MusicBrainz）
-3. **封面补充**：如果主数据源无封面，尝试从 Spotify 获取
-4. **封面本地化存储**：将远程封面下载到本地存储，更新数据库 `albums.cover` / `artists.image` 字段
-5. **失败降级**：`rescue()` 包裹，失败时返回空信息
+3. **封面来源选择**：
+   - Spotify 启用时  优先从 Spotify 搜索封面（主来源），搜索失败 fallback 到百科封面
+   - Spotify 未启用时  直接使用百科封面
+4. **封面本地化存储**：将选中的封面下载到本地存储，更新数据库 `albums.cover` / `artists.image` 字段
+   - 注意：Spotify 启用但搜索失败时，fallback 的百科封面**不**下载到本地
+5. **失败降级**：`rescue()` 包裹，失败时返回百科原始信息
 
 ## 三、缓存策略
 
@@ -817,12 +820,12 @@ UpdateSongLyrics AI Tool
 ```
   ┌───────────────────────────────────────────────────────────┐
   │                    EncyclopediaService                    │
-  │              (编排门面 + 缓存 + 封面补充)                 │
+  │              (编排门面 + 缓存 + 封面来源选择)                 │
   └─────────────┬───────────────────────────┬─────────────────┘
                 ▼                           ▼
   ┌─────────────────────┐     ┌─────────────────────────────┐
   │  Encyclopedia 接口   │     │      SpotifyService         │
-  │  (Last.fm / MB / Null)│     │     (封面补充来源)         │
+  │  (Last.fm / MB / Null)│     │     (封面优先来源)         │
   └─────────┬───────────┘     └───────────────┬─────────────┘
             │                                 │
             ▼                                 ▼
@@ -897,9 +900,10 @@ UpdateSongLyrics AI Tool
   ┌──────────────────────────────────────────────────────────┐
   │  后端 Web 路由层                                          │
   │  ┌────────────────────────────────────────────────────┐  │
-  │  │ Route: /iTunes/view-song                           │  │
+  │  │ Route: itunes/song/{album}                           │  │
   │  │   - web 路由（非 api）                             │  │
-  │  │   - api_token 鉴权（TokenManager）                 │  │
+  │  │   - 路由层：auth 中间件（Session）
+       - 控制器层：api_token 验证（Sanctum）                 │  │
   │  │   - ViewSongOnITunesController                     │  │
   │  │   - 302 重定向到 iTunes 页面                       │  │
   │  └──────────┬─────────────────────────────────────────┘  │
@@ -954,15 +958,38 @@ UpdateSongLyrics AI Tool
 
 ## 六、关键设计决策总结
 
+### 基础架构设计
+
 1. **Encyclopedia 接口 + 优先级绑定**：通过服务容器绑定实现可插拔的百科数据源，Last.fm 优先，MusicBrainz 备选
 2. **Pipeline 管道模式**：MusicBrainz 链路采用多级管道串联，每步独立缓存，应对需要多次跳转的数据源
-3. **编排门面（EncyclopediaService）**：统一缓存、封面补充、失败降级逻辑，与具体数据源解耦
+3. **编排门面（EncyclopediaService）**：统一缓存、封面来源选择、失败降级逻辑，与具体数据源解耦
 4. **歌词双层来源**：扫描阶段从文件提取（内嵌标签 + .lrc 文件），运行阶段通过 AI 工具和手动编辑补充
 5. **四级缓存架构**：前端内存 → 后端应用缓存 → 扫描期 LRU → 数据库持久化，分层减少第三方 API 调用
 6. **Null Object 模式**：NullEncyclopedia 避免调用方做空值判断
 7. **封面本地化存储**：第三方封面图片下载到本地，ULID 随机命名 + webp 格式，避免直接引用远程 URL
-8. **Spotify 补充封面策略**：百科信息无封面时才调用 Spotify，作为第二来源而非主来源
-9. **Spotify Token 独立缓存**：Access Token 与业务数据分离缓存，59 分钟（1小时减1分钟安全缓冲）
-10. **iTunes Web 路由设计**：iTunes 跳转走 web 路由而非 API 路由，便于直接 302 重定向到外部页面
-11. **iTunes 联盟营销追踪**：URL 追加 `at=1000lsGu` 联盟 ID，流量转化可追踪
-12. **前端功能开关驱动**：`uses_spotify` / `useAppleMusic` 等标志控制 UI 显示，后端配置决定前端能力
+
+### Spotify 封面相关设计决策
+
+8. **Spotify 主来源优先策略**：Spotify 启用时，封面优先从 Spotify 搜索获取，而非百科无封面才补充
+   - Spotify 启用 → 总是调用 Spotify 搜索（主来源）
+   - Spotify 搜索失败 → fallback 到百科封面（远程 URL，不下载到本地）
+   - Spotify 未启用 → 直接用百科封面（会下载到本地）
+9. **封面存储差异化处理**：Spotify 搜到的封面一定下载到本地；fallback 的百科封面（Spotify 启用但搜不到时）保持远程 URL
+10. **触发条件的运算优先级设计**：`$album->cover || !SpotifyService::enabled() && !$info->cover` 利用 `&&` 优先级高于 `||` 的特性，简洁表达分支逻辑
+11. **Spotify Token 独立缓存**：Access Token 与业务数据分离缓存，59 分钟（1 小时减 1 分钟安全缓冲），避免边界过期
+12. **Client Credentials 认证模式**：服务端调用无需用户授权，适合后台搜索类场景，Session 在 AppServiceProvider 中条件绑定（未启用时注入 null）
+13. **搜索词 artist: 精确语法**：使用 Spotify 的 `artist:` 字段语法精确匹配艺术家，提高搜索准确率
+
+### iTunes 相关设计决策
+
+14. **iTunes Web 路由设计**：iTunes 跳转走 web 路由而非 API 路由，路径 `itunes/song/{album}`，便于直接 302 重定向到外部页面
+15. **双重鉴权机制**：路由层 `auth` 中间件（Session） + 控制器层 `api_token`（Sanctum），支持 Web 点击和分享链接两种访问方式
+16. **iTunes 联盟营销追踪**：URL 追加 `at=1000lsGu` 联盟 ID，流量转化可追踪，联盟 ID 硬编码在配置中
+17. **按查询参数序列化缓存**：`serialize($request->query())` 作为缓存 key 一部分，确保不同搜索词、不同专辑有独立缓存，粒度精细
+18. **搜索词渐进式拼接**：曲目名 + 专辑名 + 艺术家名逐层追加，Unknown 和 Various 特殊值跳过，提高搜索准确率
+
+### 前后端协作设计决策
+
+19. **前端功能开关驱动**：`uses_spotify` / `uses_i_tunes` 等标志从初始数据下发，控制 UI 显示，后端配置决定前端能力
+20. **前端 watch 触发模式**：AlbumInfo / ArtistInfo 组件通过 `watch` + `immediate: true` 监听数据变化，组件挂载时自动触发百科信息获取
+21. **前端内存缓存副作用**：获取到封面后同步更新 album.cover 和所有相关歌曲的 album_cover，确保 UI 各处一致显示
