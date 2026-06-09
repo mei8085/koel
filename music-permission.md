@@ -144,17 +144,52 @@ PUT /api/songs
 
 ## 三、SongRepository 查询作用域覆盖范围
 
-`App\Repositories\SongRepository` 中各方法的可见性过滤情况：
+`App\Repositories\SongRepository` 的方法按来源可分为三类：基础继承方法、显式业务方法、私有辅助方法。每类的可见性过滤策略不同。
 
-### 3.1 应用 `accessible()` 过滤的方法（通过 `withUserContext()` 或直接调用）
+### 3.1 方法来源分类
 
-| 方法 | 过滤方式 | 说明 |
-|------|---------|------|
-| `getOne()` | `withUserContext()` | 单曲详情，找不到抛 404 |
-| `findOne()` | `withUserContext()` | 单曲查找，找不到返回 `null` |
-| `getMany()` | `withUserContext()` | 批量按 ID 获取 |
+```
+SongRepository
+├── 基础继承方法（来自 Repository 抽象基类）
+│   ├── 被 SongRepository 覆盖的：有过滤
+│   └── 未被覆盖的：无过滤
+├── 显式业务方法（SongRepository 自身定义）
+│   ├── 面向终端用户的：有过滤
+│   └── 内部/扫描用途的：无过滤
+└── 私有辅助方法
+    └── getByStandardPlaylist / getBySmartPlaylist：有过滤
+```
+
+### 3.2 基础继承方法的过滤情况
+
+`App\Repositories\Repository` 抽象基类定义了 8 个通用方法，均直接使用 `$this->modelClass::query()`，**没有任何权限过滤**。SongRepository 覆盖了其中 3 个，使其具备可见性过滤。
+
+| 基类方法 | 是否被覆盖 | 过滤情况 | 说明 |
+|---------|-----------|---------|------|
+| `getOne($id)` | ✅ 已覆盖 | 有过滤 | 覆盖后使用 `withUserContext()` |
+| `findOne($id)` | ✅ 已覆盖 | 有过滤 | 覆盖后使用 `withUserContext()` |
+| `getMany($ids, $preserveOrder)` | ✅ 已覆盖 | 有过滤 | 覆盖后使用 `withUserContext()` |
+| `resolveOne($modelOrId)` | ❌ 未覆盖 | 有过滤* | 调用 `$this->getOne()`，因多态走 SongRepository 版本 |
+| `getOneBy(array $params)` | ❌ 未覆盖 | 无过滤 | 直接 `where()->firstOrFail()` |
+| `findOneBy(array $params)` | ❌ 未覆盖 | 无过滤 | 直接 `where()->first()` |
+| `getAll()` | ❌ 未覆盖 | 无过滤 | 直接 `all()` |
+| `findFirstWhere(...$params)` | ❌ 未覆盖 | 无过滤 | 直接 `firstWhere()` |
+
+*\* `resolveOne()` 虽然定义在基类中，但其内部调用 `$this->getOne()`，由于 PHP 多态，实际执行的是 SongRepository 覆盖后的版本，因此具备过滤能力。*
+
+**未被覆盖的 4 个方法（`getOneBy`、`findOneBy`、`getAll`、`findFirstWhere`）是权限盲区**：它们继承自基类，直接查询全表，不应用 `accessible()` 过滤。如果新增业务调用了这些方法，需要额外注意权限控制。
+
+### 3.3 显式业务方法的过滤情况
+
+SongRepository 自身定义的业务方法中，面向终端用户查询的均使用 `withUserContext()` 或直接调用 `accessible()` 应用过滤。
+
+#### 3.3.1 有过滤的业务方法
+
+| 方法 | 过滤方式 | 典型用途 |
+|------|---------|---------|
 | `paginate()` | `withUserContext()` | 歌曲列表分页 |
 | `paginateByGenre()` | `withUserContext()` | 按流派分页 |
+| `paginateInFolder()` | `withUserContext()` | 文件夹内分页（含根目录） |
 | `getForQueue()` | `withUserContext()` | 队列播放列表 |
 | `getByAlbum()` | `withUserContext()` | 专辑下的歌曲 |
 | `getByArtist()` | `withUserContext()` | 艺术家下的歌曲 |
@@ -166,9 +201,9 @@ PUT /api/songs
 | `getRecentlyPlayed()` | `withUserContext()` | 最近播放 |
 | `getRandom()` | `withUserContext()` | 随机歌曲 |
 | `getByGenre()` | `withUserContext()` | 按流派获取 |
-| `getEpisodesByPodcast()` | `withUserContext()` | 播客剧集 |
-| `getUnderPaths()` | `withUserContext()` | 按文件夹路径获取 |
-| `getInFolder()` | `withUserContext()` | 文件夹内歌曲 |
+| `getEpisodesByPodcast()` | `withUserContext()` | 播客剧集列表 |
+| `getUnderPaths()` | `withUserContext()` | 按文件夹路径递归获取 |
+| `getInFolder()` | `withUserContext()` | 单个文件夹内歌曲（不含子文件夹） |
 | `searchByLyrics()` | `withUserContext()` | 歌词搜索 |
 | `getSimilarToMany()` | `withUserContext()` | 相似歌曲 |
 | `search()` | 间接（通过 `getMany()`） | 搜索结果 |
@@ -178,16 +213,43 @@ PUT /api/songs
 | `countSongs()` | 直接 `accessible()` | 歌曲总数统计 |
 | `getTotalSongLength()` | 直接 `accessible()` | 歌曲总时长 |
 
-### 3.2 不应用 `accessible()` 过滤的方法
+**文件夹相关方法的过滤说明**：
+- `paginateInFolder()` 和 `getInFolder()` 都在 `Song::query(user: $scopedUser)->withUserContext()` 的基础上追加 `folder_id` 条件，**权限过滤是完整的**
+- 两者区别仅在于：`paginateInFolder()` 返回分页结果，`getInFolder()` 返回集合且有 500 条限制
+- `getUnderPaths()` 也是同样模式，支持多路径递归获取
 
-| 方法 | 说明 |
-|------|------|
-| `findOneByPath()` | 按文件路径查找，直接 `Song::query()` 无过滤 |
-| `findByHash()` | 按哈希+所有者查找，仅过滤 `owner_id`，无完整权限检查 |
-| `getAllStoredOnCloud()` | 获取所有云存储歌曲，无过滤 |
-| `getEpisodeGuidsByPodcast()` | 通过 `$podcast->episodes()` 查询，无用户上下文 |
+#### 3.3.2 无过滤的内部方法
 
-**注意**：这几个方法主要用于扫描、同步等内部场景，不直接面向终端用户查询。
+以下方法用于扫描、同步等内部场景，不直接面向终端用户，因此不应用 `accessible()` 过滤：
+
+| 方法 | 说明 | 用途 |
+|------|------|------|
+| `findOneByPath()` | 按文件路径查找，直接 `Song::query()` | 媒体扫描时定位文件 |
+| `findByHash()` | 按哈希+所有者查找，仅过滤 `owner_id` | 去重/查重 |
+| `getAllStoredOnCloud()` | 获取所有云存储歌曲，无过滤 | 云盘同步内部逻辑 |
+| `getEpisodeGuidsByPodcast()` | 通过 `$podcast->episodes()` 查询，无用户上下文 | 播客同步内部逻辑 |
+
+### 3.4 私有辅助方法
+
+| 方法 | 过滤情况 | 调用方 |
+|------|---------|-------|
+| `getByStandardPlaylist()` | 有过滤（`withUserContext()`） | `getByPlaylist()` |
+| `getBySmartPlaylist()` | 有过滤（`withUserContext()`） | `getByPlaylist()` |
+
+两个私有方法均在 `withUserContext()` 基础上追加播放列表条件，权限过滤完整。
+
+### 3.5 总结：哪些路径会自动套 `accessible()`
+
+**会自动过滤的路径**：
+- 所有通过 `withUserContext()` 入口的查询（面向用户的列表、详情、搜索、统计）
+- 被 SongRepository 覆盖的基础方法：`getOne`、`findOne`、`getMany`
+- 通过多态间接获得过滤的：`resolveOne`
+- 私有辅助方法：`getByStandardPlaylist`、`getBySmartPlaylist`
+
+**不会自动过滤的路径**：
+- 未被覆盖的基础继承方法：`getOneBy`、`findOneBy`、`getAll`、`findFirstWhere`
+- 内部扫描/同步方法：`findOneByPath`、`findByHash`、`getAllStoredOnCloud`、`getEpisodeGuidsByPodcast`
+- 控制器中直接 `Song::query()->findMany()` 绕过 Repository 的调用（如编辑接口的授权检查）
 
 ---
 
