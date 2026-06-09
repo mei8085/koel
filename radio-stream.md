@@ -587,7 +587,298 @@ playbackManager.usePlayback('queue')
 
 ---
 
-## 六、关键设计决策总结
+## 六、状态接管的容易误解点详解
+
+这是最容易产生困惑的部分：电台暂停后到底算不算"当前项"？切回队列时显示什么？轮询什么时候清？本节逐一拆解。
+
+### 6.1 Paused 与 Stopped 的边界
+
+首先明确两个核心判定逻辑：
+
+**电台 current 的判定**：
+**关键代码**：[radioStationStore.ts#L61-L63](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/stores/radioStationStore.ts#L61-L63)
+
+```typescript
+get current() {
+  return this.state.stations.find(station => station.playback_state !== 'Stopped') || null
+}
+```
+
+**队列 current 的判定**：
+**关键代码**：[queueStore.ts#L148-L152](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/stores/queueStore.ts#L148-L152)
+
+```typescript
+get current() {
+  return this.all.find(({ playback_state }) => playback_state !== 'Stopped') || playableStore.findPlaying()
+}
+```
+
+**关键结论**：
+- 两者的 current 判定逻辑完全一致：**只要不是 Stopped 就算 current**
+- Paused 状态的电台 / 歌曲，仍然被视为各自体系内的 current
+- 只有 Stopped 状态才会从 current 中排除
+
+### 6.2 电台 stop() ≠ Stopped
+
+这是最容易踩的坑。电台的 `stop()` 方法实际上直接调用 `pause()`：
+
+**关键代码**：[RadioPlaybackService.ts#L18-L20](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/services/RadioPlaybackService.ts#L18-L20)
+
+```typescript
+public async stop() {
+  return this.pause()
+}
+```
+
+**pause() 的行为**：
+**关键代码**：[RadioPlaybackService.ts#L43-L59](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/services/RadioPlaybackService.ts#L43-L59)
+
+```typescript
+public async pause() {
+  radioStationStore.stopPolling()      // 停止轮询 + 清空 nowPlaying
+
+  use(radioStationStore.current, station => {
+    station.playback_state = 'Paused' // 注意：是 Paused，不是 Stopped
+    socketService.broadcast('SOCKET_STREAMABLE', station)
+  })
+
+  if (this.media) {
+    this.media.pause()
+    this.media.currentTime = 0
+    this.media.removeAttribute('src') // 清空媒体源
+  }
+}
+```
+
+**重要结论**：
+- 调用 `radioPlayback.stop()` 后，电台状态是 **Paused**，不是 Stopped
+- 因此，**暂停后的电台仍然是 radioStationStore.current**
+- 只有在播放另一个电台时，前一个电台才会被显式设为 Stopped
+
+### 6.3 从电台切到队列：完整状态迁移
+
+下面是用户点击播放一首本地歌曲时，状态变化的完整时序：
+
+```
+初始状态：
+  - 电台A Playing（radioStationStore.current = 电台A）
+  - 歌曲X Stopped（queueStore.current = 歌曲X？不，Stopped 不算）
+  - currentStreamable = 电台A
+
+用户点击播放歌曲X
+    │
+    ▼
+playback('queue').play(songX)
+    │
+    ▼
+playbackManager.usePlayback('queue')
+    │
+    ├─► radioPlayback.deactivate()           ◄── 第一步：停用电台服务
+    │     ├─► 解绑媒体事件监听器
+    │     └─► radioPlayback.stop()
+    │           └─► pause()
+    │                 ├─► stopPolling()       ◄── 停止轮询 + 清空 nowPlaying
+    │                 ├─► 电台A.playback_state = Paused
+    │                 └─► media.pause() + 移除 src
+    │
+    │  【关键点 1】此时：
+    │  - 电台A状态 = Paused → 仍然是 radioStationStore.current
+    │  - 但 radioStationStore.current 的引用没变（同一个对象）
+    │  - 所以电台 watcher 不触发（浅比较：引用相同 = 值未变）
+    │
+    ├─► queuePlayback.activate()              ◄── 第二步：激活队列服务
+    │     └─► 绑定媒体事件 + 设置音量 + MediaSession
+    │
+    └─► queuePlayback.play(songX)             ◄── 第三步：播放歌曲
+          ├─► 前一首歌曲.playback_state = Stopped（如果有的话）
+          ├─► songX.playback_state = Playing
+          │
+          │  【关键点 2】此时：
+          │  - queueStore.current 变化了（songX 变成 Playing）
+          │  - 队列 watcher 触发 → currentStreamable = songX
+          │
+          ├─► 设置 media.src
+          └─► media.play()
+
+最终状态：
+  - 电台A Paused（仍然是 radioStationStore.current）
+  - 歌曲X Playing（queueStore.current = 歌曲X）
+  - currentStreamable = 歌曲X ◄── 底部栏显示歌曲信息
+```
+
+**为什么底部栏正确显示了歌曲？**
+- 不是因为电台被"挤掉"了，而是因为队列的 current 变化触发了队列 watcher
+- 电台那边的 current 引用没变，所以电台 watcher 没触发，没有覆盖
+- 最终结果是 **队列 watcher 的更新生效**，显示歌曲信息
+
+### 6.4 从队列切回电台：完整状态迁移
+
+从队列切回电台时，有一个巧妙的设计保证了 watcher 能正确触发：
+
+**关键代码**：[RadioPlaybackService.ts#L7-L16](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/services/RadioPlaybackService.ts#L7-L16)
+
+```typescript
+public async play(station: RadioStation) {
+  // 先把当前电台设为 Stopped（即使就是同一个电台）
+  use(radioStationStore.current, station => (station.playback_state = 'Stopped'))
+
+  station.playback_state = 'Playing'
+  ...
+}
+```
+
+**完整时序**：
+
+```
+初始状态：
+  - 歌曲X Playing（queueStore.current = 歌曲X）
+  - 电台A Paused（radioStationStore.current = 电台A）
+  - currentStreamable = 歌曲X
+
+用户点击播放电台A
+    │
+    ▼
+playback('radio').play(stationA)
+    │
+    ▼
+playbackManager.usePlayback('radio')
+    │
+    ├─► queuePlayback.deactivate()           ◄── 第一步：停用队列服务
+    │     ├─► 解绑媒体事件
+    │     └─► queuePlayback.stop()
+    │           └─► songX.playback_state = Stopped
+    │
+    │  【关键点 1】此时：
+    │  - queueStore.current 变化（歌曲X Stopped 了）
+    │  - 队列 watcher 触发 → currentStreamable = 下一首 / undefined
+    │
+    ├─► radioPlayback.activate()              ◄── 第二步：激活电台服务
+    │
+    └─► radioPlayback.play(stationA)          ◄── 第三步：播放电台
+          │
+          ├─► radioStationStore.current 是电台A（Paused）
+          ├─► stationA.playback_state = Stopped  ◄── 先设为 Stopped
+          │     │
+          │     │  【关键点 2】此时：
+          │     │  - radioStationStore.current 变成 null（Stopped 不算）
+          │     │  - 电台 watcher 触发：station 是 null → 不赋值
+          │     │
+          ├─► stationA.playback_state = Playing  ◄── 再设为 Playing
+          │     │
+          │     │  【关键点 3】此时：
+          │     │  - radioStationStore.current 又变回电台A
+          │     │  - 电台 watcher 触发：station 有值 → currentStreamable = stationA
+          │     │
+          ├─► 设置 media.src
+          └─► media.play() + startPolling()
+
+最终状态：
+  - 电台A Playing（radioStationStore.current = 电台A）
+  - 歌曲X Stopped
+  - currentStreamable = 电台A ◄── 底部栏显示电台信息
+```
+
+**为什么要先 Stopped 再 Playing？**
+- 因为 Vue 的 watch 是**浅比较**（引用比较）
+- 如果电台对象引用没变，只是内部属性从 Paused → Playing，watcher 不会触发
+- 通过 Stopped → Playing 的两次切换，让 `radioStationStore.current` 经历 null → station 的引用变化，确保 watcher 触发
+
+这是一个**刻意为之的设计**，用来保证 currentStreamable 总能正确更新。
+
+### 6.5 轮询清理的时机
+
+轮询（polling）的启动和停止是对称的：
+
+| 操作 | 轮询状态 | nowPlaying 值 |
+|------|----------|---------------|
+| `play(station)` | 启动（15秒间隔） | 立即拉取一次 |
+| `pause()` | 停止 | 清空为 null |
+| `stop()` | 停止（因为 stop → pause） | 清空为 null |
+| `deactivate()` | 停止（deactivate → stop → pause） | 清空为 null |
+
+**关键代码**：[radioStationStore.ts#L91-L104](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/stores/radioStationStore.ts#L91-L104)
+
+```typescript
+startPolling(station: RadioStation) {
+  this.stopPolling()               // 先清旧的
+  this.fetchNowPlaying(station)    // 立即拉一次
+  this._pollTimer = setInterval(..., POLL_INTERVAL)
+},
+
+stopPolling() {
+  if (this._pollTimer) {
+    clearInterval(this._pollTimer)
+    this._pollTimer = null
+  }
+  this.nowPlaying.value = null     // 同时清空显示值
+},
+```
+
+**重要结论**：
+- 只要电台进入 Paused 状态（无论是主动暂停还是被 deactivate），**轮询立即停止，元数据立即清空**
+- 所以暂停电台后，底部栏的"正在播放"行会从歌曲名切换回电台描述
+
+### 6.6 底部播放栏的显示逻辑
+
+底部播放栏通过 `currentStreamable` 统一渲染，但内部会根据类型分流：
+
+**关键代码**：[app-footer/index.vue#L60-L61](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/components/layout/app-footer/index.vue#L60-L61)
+
+```vue
+<RadioStationInfo v-if="isRadio" />
+<SongInfo v-else />
+```
+
+```typescript
+const isRadio = computed(() => currentStreamable.value && isRadioStation(currentStreamable.value))
+```
+
+**显示判断链**：
+1. `currentStreamable` 有值吗？ → 没有则显示空状态 / 默认占位
+2. 有值的话，是电台类型吗？ → 是则渲染 `FooterRadioStationInfo`
+3. 否则渲染 `FooterPlayableInfo`（歌曲 / 播客）
+
+**播放按钮的行为**：
+**关键代码**：[FooterPlayButton.vue#L76-L88](file:///d:/fz/0508-2/solo-dogfeeding/code/111-koel/resources/assets/js/components/ui/FooterPlayButton.vue#L76-L88)
+
+```typescript
+const toggle = async () => {
+  if (!streamable.value) {
+    await initiatePlayback()   // 没有当前项时，随机播放队列
+    return
+  }
+
+  if (isRadio.value) {
+    await playback('radio').toggle()   // 电台调用电台服务的 toggle
+    return
+  }
+
+  await playback('queue').toggle()     // 歌曲调用队列服务的 toggle
+}
+```
+
+**注意**：点击播放按钮时，会根据当前 streamable 的类型选择对应的播放服务。这意味着：
+- 如果底部栏显示的是电台，点暂停 / 播放走的是 RadioPlaybackService
+- 如果显示的是歌曲，点暂停 / 播放走的是 QueuePlaybackService
+- 不会出现"显示着电台但用队列服务播放"的错乱
+
+### 6.7 容易误解点速查表
+
+| 问题 | 答案 | 原因 |
+|------|------|------|
+| 电台暂停后还是 current 吗？ | **是** | Paused ≠ Stopped，current 判定只排除 Stopped |
+| 电台 stop() 后状态是？ | **Paused** | stop() 内部直接调用 pause() |
+| 从电台切到队列，电台状态是？ | **Paused** | deactivate → stop → pause |
+| 从电台切到队列，底部栏显示什么？ | **队列歌曲** | 队列 watcher 触发，更新了 currentStreamable |
+| 为什么电台暂停了还显示歌曲？ | 因为你切到了队列播放，底部栏显示的是队列的 current | 两个体系各有 current，最终显示哪个由 watcher 触发顺序和优先级决定 |
+| 电台暂停后轮询还在吗？ | **不在了** | pause() 里调用了 stopPolling() |
+| 电台暂停后还显示歌曲名吗？ | **不显示** | stopPolling() 把 nowPlaying 清空了，显示电台描述 |
+| 为什么 play() 要先设 Stopped？ | 为了触发 watcher 的引用变化 | Vue watch 是浅比较，同对象改属性不触发，得经历 null→station 才行 |
+| 电台和队列都有 Paused 的项，显示谁？ | 取决于谁的 watcher 最后一次触发 | 通常是后发生状态变化的那个；电台 watcher 只有有值时才覆盖 |
+
+---
+
+## 七、关键设计决策总结
 
 | 决策点 | 方案 | 理由 |
 |--------|------|------|
