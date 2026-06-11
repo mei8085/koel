@@ -303,11 +303,11 @@ protected $with = ['album', 'artist', 'album.artist', 'podcast', 'genres', 'owne
 | `genres` | BelongsToMany | genre_song + genres | 2 条 SQL（pivot 表 + 目标表） |
 | `owner` | BelongsTo | users | `WHERE id IN (...)` |
 
-**基础 SQL 数量（仅 Song 自身 $with）**：6 个关联 → **7 条 SQL**（albums、artists×2、podcasts、genre_song + genres、users）。
+**基础 SQL 数量（仅 Song 自身 `$with`）**：6 个关联 → **7 条 SQL**（albums、artists×2、podcasts、genre_song + genres、users）。
 
-> 注意：lbum.artist 与 rtist 是**两次独立查询**——前者是「专辑的艺术家」，后者是「歌曲的艺术家」，二者可能指向不同的 Artist 记录（例如合辑中的歌曲，歌曲艺术家与专辑艺术家不同）。
-
-> 重要：以上只是基础层。**每个关联模型自身可能还有 $with，会递归触发更多 SQL**——详见 §4.7 的递归展开分析。
+> 注意：`album.artist` 与 `artist` 是**两次独立查询**——前者是「专辑的艺术家」，后者是「歌曲的艺术家」，二者可能指向不同的 Artist 记录（例如合辑中的歌曲，歌曲艺术家与专辑艺术家不同）。
+>
+> 以上只是基础层。**每个关联模型自身可能还有 `$with`，会递归触发更多 SQL**——详见 §4.7 的递归展开分析。
 
 ### 4.2 字段溯源：每个输出字段的数据来源
 
@@ -372,7 +372,7 @@ $this->album?->artist  ← 先取 album 关联，再取 album 的 artist 关联
 
 这是一个**跨两级关联的访问器**：song → album → artist。Eager Load 时必须写成 `'album.artist'`（嵌套点语法）才能避免 N+1。
 
-> **额外发现**：Album 模型自身也有 `$with = ['artist']`（[Album.php L63](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/Album.php#L63)）。这意味着「仅 Eager Load album」时，Album 查询也会自动带上 artist。因此 Song 的 `$with` 中的 `'album.artist'` 是**冗余声明**——去掉它，album 的 artist 仍然会通过 Album 模型的 $with 自动加载。这是一处「双保险」式的冗余设计。
+> **额外发现**：Album 模型自身也有 `$with = ['artist']`（[Album.php L63](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/Album.php#L63)）。这意味着「仅 Eager Load album」时，Album 查询也会自动带上 artist。因此 Song 的 `$with` 中的 `'album.artist'` 是**冗余声明**——去掉它，album 的 artist 仍然会通过 Album 模型的 `$with` 自动加载。这是一处「双保险」式的冗余设计。
 
 #### 4.3.3 `ownedBy()` 的实现
 
@@ -427,22 +427,23 @@ public function ownedBy(User $user): bool
 | **合计** | ~961 个模型 | | **~1.5 MB** |
 
 Eager Loading 的内存开销约为主查询结果的 50%，但相比 N+1 查询的数据库 round-trip 开销，仍然是值得的。
+
 ### 4.7 递归 $with 的完整 SQL 展开（精确计数）
 
-此前分析只停留在 Song 的 $with 表层，忽略了一个关键事实：**Laravel 的 Eager Loading 是递归的**——关联模型自身的 $with 也会被自动加载。这会导致实际 SQL 数量远超表面上的 6 个关联。
+此前分析只停留在 Song 的 `$with` 表层，忽略了一个关键事实：**Laravel 的 Eager Loading 是递归的**——关联模型自身的 `$with` 也会被自动加载。这会导致实际 SQL 数量远超表面上的 6 个关联。
 
 #### 4.7.1 各关联模型自身的 $with 声明
 
 逐个检查 Song 的 6 个关联目标模型：
 
 | Song 关联 | 目标模型 | 目标模型的 $with | 引入的额外关联 |
-|----------|---------|-------------------|--------------|
-| lbum | Album | ['artist']（Album.php L63） | 1 个 BelongsTo（album.artist） |
-| rtist | Artist | 无 | 0 |
-| lbum.artist | Artist | 无 | 0 |
-| podcast | Podcast | 无 | 0 |
-| genres | Genre | 无 | 0 |
-| owner | User | ['roles', 'permissions']（User.php L84） | 2 个 BelongsToMany（Spatie Permission） |
+|----------|---------|-----------------|--------------|
+| `album` | Album | `['artist']`（[Album.php L63](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/Album.php#L63)） | 1 个 BelongsTo（album.artist） |
+| `artist` | Artist | 无 | 0 |
+| `album.artist` | Artist | 无 | 0 |
+| `podcast` | Podcast | 无 | 0 |
+| `genres` | Genre | 无 | 0 |
+| `owner` | User | `['roles', 'permissions']`（[User.php L84](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/User.php#L84)） | 2 个 BelongsToMany（Spatie Permission） |
 
 #### 4.7.2 SQL 逐条展开明细
 
@@ -452,57 +453,56 @@ Eager Loading 的内存开销约为主查询结果的 50%，但相比 N+1 查询
 
 | # | 关联 | 关系类型 | 实际 SQL |
 |---|------|---------|---------|
-| 1 | lbum | BelongsTo | SELECT * FROM albums WHERE id IN (...) |
-| 2 | rtist | BelongsTo | SELECT * FROM artists WHERE id IN (...) |
-| 3 | lbum.artist | BelongsTo (嵌套) | SELECT * FROM artists WHERE id IN (...) |
-| 4 | podcast | BelongsTo | SELECT * FROM podcasts WHERE id IN (...)（结果集为空，但仍执行） |
-| 5 | genres (pivot) | BelongsToMany | SELECT * FROM genre_song WHERE song_id IN (...) |
-| 6 | genres (目标) | BelongsToMany | SELECT * FROM genres WHERE id IN (...) |
-| 7 | owner | BelongsTo | SELECT * FROM users WHERE id IN (...) |
+| 1 | `album` | BelongsTo | `SELECT * FROM albums WHERE id IN (...)` |
+| 2 | `artist` | BelongsTo | `SELECT * FROM artists WHERE id IN (...)` |
+| 3 | `album.artist` | BelongsTo (嵌套) | `SELECT * FROM artists WHERE id IN (...)` |
+| 4 | `podcast` | BelongsTo | `SELECT * FROM podcasts WHERE id IN (...)`（结果集为空，但仍执行） |
+| 5 | `genres` (pivot) | BelongsToMany | `SELECT * FROM genre_song WHERE song_id IN (...)` |
+| 6 | `genres` (目标) | BelongsToMany | `SELECT * FROM genres WHERE id IN (...)` |
+| 7 | `owner` | BelongsTo | `SELECT * FROM users WHERE id IN (...)` |
 
 **第二层：关联模型递归 $with（5 条）**
 
 | # | 触发来源 | 关系类型 | 实际 SQL |
 |---|---------|---------|---------|
-| 8 | Album::$with -> rtist | BelongsTo | SELECT * FROM artists WHERE id IN (...)（与 #3 完全重复） |
-| 9 | User::$with -> oles (pivot) | BelongsToMany (Spatie) | SELECT * FROM model_has_roles WHERE model_type = 'User' AND model_id IN (...) |
-| 10 | User::$with -> oles (目标) | BelongsToMany (Spatie) | SELECT * FROM roles WHERE id IN (...) |
-| 11 | User::$with -> permissions (pivot) | BelongsToMany (Spatie) | SELECT * FROM model_has_permissions WHERE model_type = 'User' AND model_id IN (...) |
-| 12 | User::$with -> permissions (目标) | BelongsToMany (Spatie) | SELECT * FROM permissions WHERE id IN (...) |
+| 8 | Album::$with → `artist` | BelongsTo | `SELECT * FROM artists WHERE id IN (...)` ← 与 #3 完全重复 |
+| 9 | User::$with → `roles` (pivot) | BelongsToMany (Spatie) | `SELECT * FROM model_has_roles WHERE model_type = 'App\Models\User' AND model_id IN (...)` |
+| 10 | User::$with → `roles` (目标) | BelongsToMany (Spatie) | `SELECT * FROM roles WHERE id IN (...)` |
+| 11 | User::$with → `permissions` (pivot) | BelongsToMany (Spatie) | `SELECT * FROM model_has_permissions WHERE model_type = 'App\Models\User' AND model_id IN (...)` |
+| 12 | User::$with → `permissions` (目标) | BelongsToMany (Spatie) | `SELECT * FROM permissions WHERE id IN (...)` |
 
 #### 4.7.3 关于重复 SQL 的关键澄清
 
-lbum.artist 存在**双重加载机制**：
-- 路径 A：Song 的 $with 显式声明 'album.artist'，Laravel 在加载完 albums 后执行一次 artists 查询
-- 路径 B：Album 的 $with 隐式声明 'artist'，Album 模型被 Hydration 时，Eloquent 又执行一次 artists 查询
+`album.artist` 存在**双重加载机制**：
+- 路径 A：Song 的 `$with` 显式声明 `'album.artist'` → Laravel 在加载完 albums 后执行一次 artists 查询
+- 路径 B：Album 的 `$with` 隐式声明 `'artist'` → Album 模型被 Hydration 时，Eloquent 又执行一次 artists 查询
 
-两条 SQL 完全相同（SELECT * FROM artists WHERE id IN (...)），但**数据库实际执行两次**。这是纯粹的性能浪费。
+两条 SQL 完全相同（`SELECT * FROM artists WHERE id IN (...)`），但**数据库实际执行两次**。这是纯粹的性能浪费。
 
-> 在 Community 版（智能播放列表的歌曲都属于当前用户），owner 通常只有 1 条记录，因此 User 的 roles/permissions 4 条 SQL 的 IN (...) 只有一个 ID，执行很快，但仍然是 4 次不必要的 round-trip。
+> 在 Community 版（智能播放列表的歌曲都属于当前用户），owner 通常只有 1 条记录，因此 User 的 roles/permissions 4 条 SQL 的 `IN (...)` 只有一个 ID，执行很快，但仍然是 4 次不必要的 round-trip。
 
 #### 4.7.4 精确总数汇总
 
 | 层级 | SQL 数量 | 说明 |
 |------|:-------:|------|
-| 第一层（Song::$with） | 7 条 | albums、artists x 2、podcasts、genre_song、genres、users |
+| 第一层（Song::$with） | 7 条 | albums、artists×2、podcasts、genre_song、genres、users |
 | 第二层（递归 $with） | 5 条 | Album.artist(重复 1 条) + User.roles(2 条) + User.permissions(2 条) |
 | 其中重复/可避免 | 6 条 | album.artist 重复 1 条 + podcast(空) 1 条 + roles 2 条 + permissions 2 条 |
 | **实际总计** | **12 条** | **此前估算 6 条，偏差率 100%** |
 
 #### 4.7.5 对性能结论的修正影响
 
-此前报告中「$with Eager Loading（6 条关联查询）占耗时 ~20%」的估算需要修正：
+此前报告中「`$with` Eager Loading（6 条关联查询）占耗时 ~20%」的估算需要修正：
 
-- **实际 SQL 数量**：从 6 条到 12 条（翻倍）
+- **实际 SQL 数量**：从 6 条 → 12 条（翻倍）
 - **性能占比影响**：虽然 roles/permissions 对单用户场景查询很快（单 ID IN），但 12 次 round-trip 的固定开销不可忽视
 - **裁剪收益重估**：
-  - without('podcast')：省 1 条 SQL（原估算）
-  - 清理 lbum.artist 冗余声明：省 1 条重复 SQL（此前遗漏）
-  - 若在 owner 关联上用 ->without('roles', 'permissions')：再省 4 条 SQL（此前完全未知）
+  - `without('podcast')`：省 1 条 SQL（原估算）
+  - 清理 `album.artist` 冗余声明：省 1 条重复 SQL（此前遗漏）
+  - 若在 owner 关联上用 `->without('roles', 'permissions')`：再省 4 条 SQL（此前完全未知）
   - **累计可省 6 条 SQL**，而不是此前估算的 1 条
 
 **结论**：Eager Loading 的真实开销比此前估算高出一倍，但其中约一半是可消除的冗余和不必要的递归加载。优化优先级需要重新排序：清理 User 的 roles/permissions（4 条）> 裁剪 podcast（1 条）= 清理 album.artist 重复（1 条）。
-
 
 ---
 
@@ -619,19 +619,19 @@ LIMIT 500
 | 「ORDER BY songs.title 需要 title 索引」 | **title 索引也不会生效** | 前面有 `accessible()` 的大量条件和多个 `OR` 组，MySQL 优化器通常选择全表扫描后 filesort；**真正的瓶颈是 WHERE，不是 ORDER BY** |
 | 「genres 关联可以不加载，因为 genre 是访问器」 | **genre 访问器恰恰强依赖 genres 关联集合** | `genre` Attribute 实现为 `$this->genres->pluck('name')->sort()->implode(', ')`（[HasSongAttributes.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/Concerns/Songs/HasSongAttributes.php)），去掉 Eager Load 会触发 N+1 查询 |
 | 「album / artist / owner 等多个关联都可以裁剪」 | **6 个关联中只有 podcast 可安全裁剪** | 逐字段溯源：artist_name 输出用的是关联而非冗余列、album_cover/album_artist 必须走 album 关联、owner 输出 public_id 不在 songs 表。仅 podcast 在 type=SONG 时无数据可裁剪 |
-| 「Eager Loading 约 6 条 SQL」 | **实际 12 条 SQL，低估 100%** | Laravel 递归加载关联模型自身的 $with：Album 隐式 rtist（重复 1 条） + User 的 oles + permissions（Spatie Permission，各 2 条共 4 条），额外增加 5 条 |
-| 「裁剪 podcast 是唯一可优化项」 | **可优化 6 条 SQL（占总量一半）** | User.roles/permissions（4 条）> podcast（1 条）= album.artist 重复（1 条），owner 关联可用 ->without('roles', 'permissions') 禁用递归 $with |
+| 「Eager Loading 约 6 条 SQL」 | **实际 12 条 SQL，低估 100%** | Laravel 递归加载关联模型自身的 `$with`：Album 隐式 `artist`（重复 1 条）+ User 的 `roles` + `permissions`（Spatie Permission，各 2 条共 4 条），额外增加 5 条 |
+| 「裁剪 podcast 是唯一可优化项」 | **可优化 6 条 SQL（占总量一半）** | User.roles/permissions（4 条）> podcast（1 条）= album.artist 重复（1 条），owner 关联可用 `->without('roles', 'permissions')` 禁用递归 `$with` |
 
 ### 6.2 每次查询的性能成本分解
 
-> **修正说明**：此前估算 Eager Loading 为 6 条 SQL，经递归 $with 展开核实（详见 §4.7），实际为 **12 条 SQL**，其中约 6 条为可消除的冗余/不必要查询。
+> **修正说明**：此前估算 Eager Loading 为 6 条 SQL，经递归 `$with` 展开核实（详见 §4.7），实际为 **12 条 SQL**，其中约 6 条为可消除的冗余/不必要查询。
 
 | 环节 | 耗时占比（估算） | 特点 |
 |------|:---------------:|------|
 | 主查询（含 5 JOIN + 多 EXISTS 子查询 + ORDER BY） | ~55% | 磁盘 IO 瓶颈，随 songs 表行数线性增长 |
 | 结果集物化 + 模型 Hydration | ~10% | PHP CPU 瓶颈，500 行较轻 |
-| $with Eager Loading（12 条 SQL，含 6 条可优化） | ~25% | 额外 round-trip 翻倍，含 roles/permissions 4 条、album.artist 重复 1 条、podcast 空查询 1 条 |
-| SongResource::toArray() 序列化 | ~8% | PHP CPU 瓶颈 |
+| `$with` Eager Loading（12 条 SQL，含 6 条可优化） | ~25% | 额外 round-trip 翻倍，含 roles/permissions 4 条、album.artist 重复 1 条、podcast 空查询 1 条 |
+| `SongResource::toArray()` 序列化 | ~8% | PHP CPU 瓶颈 |
 | JSON 编码 + HTTP 传输 | ~2% | 网络瓶颈 |
 
 **Eager Loading 修正要点**：
@@ -716,38 +716,38 @@ LIMIT 500
 
 **立即可实施的优化**（按收益/成本重新排序，收益按节省 SQL 条数计）：
 
-1. **在 owner 关联上禁用 User 的递归 $with**（成本：零成本，一行代码）：
-   `php
-   ->with(['owner' => fn () => ->without('roles', 'permissions')]);
-   `
-   收益：省 **4 条 SQL**（Spatie Permission 的 model_has_roles + roles + model_has_permissions + permissions）。智能播放列表的 SongResource 只用到 owner->public_id 和 owner->id，完全不需要角色和权限信息。
+1. **在 owner 关联上禁用 User 的递归 `$with`**（成本：零成本，一行代码）：
+   ```php
+   $query->with(['owner' => fn ($q) => $q->without('roles', 'permissions')]);
+   ```
+   收益：省 **4 条 SQL**（Spatie Permission 的 model_has_roles + roles + model_has_permissions + permissions）。智能播放列表的 SongResource 只用到 `owner->public_id` 和 `owner->id`，完全不需要角色和权限信息。
 
-2. **裁剪 podcast 关联**（成本：零成本，一行代码）：
-   `php
-   ->without('podcast');
-   `
+2. **裁剪 `podcast` 关联**（成本：零成本，一行代码）：
+   ```php
+   $query->without('podcast');
+   ```
    收益：省 1 条 SQL，虽然结果集为空但仍需一次 round-trip。
 
-3. **清理 lbum.artist 的冗余声明（去重查询）**（成本：极低）：
-   Album 模型的 $with = ['artist'] 已会自动加载专辑艺术家，Song 的 $with 中 'album.artist' 会导致**两次完全相同的 SELECT * FROM artists WHERE id IN (...)**。去掉 Song 的 'album.artist' 声明，收益：省 **1 条重复 SQL**。
+3. **清理 `album.artist` 的冗余声明（去重查询）**（成本：极低）：
+   Album 模型的 `$with = ['artist']` 已会自动加载专辑艺术家，Song 的 `$with` 中 `'album.artist'` 会导致**两次完全相同的 `SELECT * FROM artists WHERE id IN (...)`**。去掉 Song 的 `'album.artist'` 声明，收益：省 **1 条重复 SQL**。
 
-   > 注意：仅去掉 Song 中的声明，不要动 Album 的 $with——其他场景可能需要 Album 自带 artist。
+   > 注意：仅去掉 Song 中的声明，不要动 Album 的 `$with`——其他场景可能需要 Album 自带 artist。
 
-4. **用 songs.artist_name 冗余列替代 rtist->name**（成本：极小，改一行 SongResource）：
-   `php
-   // SongResource L93: 'artist_name' => ->song->artist?->name,
+4. **用 `songs.artist_name` 冗余列替代 `artist->name`**（成本：极小，改一行 SongResource）：
+   ```php
+   // SongResource L93: 'artist_name' => $this->song->artist?->name,
    // 改为:
-   'artist_name' => ->song->artist_name,
-   `
-   然后 ->without('artist')。收益：省 1 条 SQL + N 个 Artist 模型。
-   > 一致性保障：songs.artist_name 在 INSERT/UPDATE 时与 rtist_id 同步写入，数据一致性有保障。
+   'artist_name' => $this->song->artist_name,
+   ```
+   然后 `->without('artist')`。收益：省 1 条 SQL + N 个 Artist 模型。
+   > 一致性保障：`songs.artist_name` 在 INSERT/UPDATE 时与 `artist_id` 同步写入，数据一致性有保障。
 
 5. **genres 关联的字段裁剪**：BelongsToMany 多对多关系可用回调限定列：
-   `php
-   ->with(['genres' => fn () => ->select('genres.id', 'genres.name')])
-   `
+   ```php
+   ->with(['genres' => fn ($q) => $q->select('genres.id', 'genres.name')])
+   ```
 
-6. **owner 关联只加载 public_id**：User 模型关联可用 ->with('owner:id,public_id') 只取需要的两列（配合第 1 条禁用 roles/permissions 使用）。
+6. **owner 关联只加载 public_id**：User 模型关联可用 `->with('owner:id,public_id')` 只取需要的两列（配合第 1 条禁用 roles/permissions 使用）。
 
 **优化后 SQL 数量预估**：从 12 条 → 6 条（减少 50%），Eager Loading 耗时占比从 ~25% 降至 ~12%。
 
