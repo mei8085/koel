@@ -282,9 +282,155 @@ SELECT COALESCE(interactions.play_count, 0) AS play_count
 
 ---
 
-## 四、规则组的括号嵌套机制与 AND/OR 语义正确性
+## 四、Eager Loading 依赖关系深度剖析
 
-### 4.1 代码中的组合逻辑原语（[SongRepository.php L243-L255](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Repositories/SongRepository.php#L243-L255)）
+> 本章是对前次分析的修正与深化。前次分析中"genres 也可以不加载"的判断是**错误的**——`$song->genre` 字符串访问器恰恰依赖 genres 关联的 Eloquent 集合。下面顺着代码逐一验证每个关联的真实用途。
+
+### 4.1 Song 模型的全局 Eager Load 清单
+
+Song 模型通过 `$with` 属性定义了 6 个默认自动加载的关联（[Song.php L118](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/Song.php#L118)）：
+
+```php
+protected $with = ['album', 'artist', 'album.artist', 'podcast', 'genres', 'owner'];
+```
+
+| 关联标识 | 关系类型 | 对应表 | 查询方式 |
+|---------|---------|-------|---------|
+| `album` | BelongsTo | albums | `WHERE id IN (...)` |
+| `artist` | BelongsTo | artists | `WHERE id IN (...)` |
+| `album.artist` | BelongsTo (嵌套) | artists | `WHERE id IN (...)` |
+| `podcast` | BelongsTo | podcasts | `WHERE id IN (...)` |
+| `genres` | BelongsToMany | genre_song + genres | 2 条 SQL（pivot 表 + 目标表） |
+| `owner` | BelongsTo | users | `WHERE id IN (...)` |
+
+**实际触发的 SQL 数量**：500 首歌的查询会额外产生 **6 条 SQL**（albums、artists×2、podcasts、genres×2、users）。
+
+> 注意：`album.artist` 与 `artist` 是**两次独立查询**——前者是「专辑的艺术家」，后者是「歌曲的艺术家」，二者可能指向不同的 Artist 记录（例如合辑中的歌曲，歌曲艺术家与专辑艺术家不同）。
+
+### 4.2 字段溯源：每个输出字段的数据来源
+
+顺着 [SongResource.php L78-L135](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Http/Resources/SongResource.php#L78-L135) 的 `toArray()` 逐字段溯源：
+
+| 输出字段 | 代码行 | 数据来源 | 依赖的关联 |
+|---------|:-----:|---------|:---------:|
+| `type` | L86 | `$song->type`（Attribute，基于 `podcast_id` 判断） | ❌ 无需 |
+| `id` | L87 | `songs.id`（原生列） | ❌ 无需 |
+| `title` | L88 | `songs.title`（原生列） | ❌ 无需 |
+| `lyrics` | L89 | `songs.lyrics`（原生列） | ❌ 无需 |
+| `album_id` | L90 | `songs.album_id`（原生列） | ❌ 无需 |
+| `album_name` | L91 | `songs.album_name`（原生冗余列） | ❌ 无需 |
+| `artist_id` | L92 | `songs.artist_id`（原生列） | ❌ 无需 |
+| `artist_name` | L93 | `$song->artist?->name` | ✅ `artist` |
+| `album_artist_id` | L94 | `$song->album_artist?->id`（Attribute：`album?->artist`） | ✅ `album` + `album.artist` |
+| `album_artist_name` | L95 | `$song->album_artist?->name`（同上） | ✅ `album` + `album.artist` |
+| `album_cover` | L96 | `image_storage_url($song->album?->cover)` | ✅ `album` |
+| `length` | L97 | `songs.length`（原生列） | ❌ 无需 |
+| `liked` / `favorite` | L98-L99 | `$song->favorite`（计算列，来自 `withFavoriteStatus()`） | ❌ 无需（LEFT JOIN 计算） |
+| `play_count` | L100 | `(int) $song->play_count`（计算列，来自 `withPlayCount()`） | ❌ 无需（LEFT JOIN 计算） |
+| `track` | L101 | `songs.track`（原生列） | ❌ 无需 |
+| `disc` | L102 | `songs.disc`（原生列） | ❌ 无需 |
+| `genre` | L103 | `$song->genre`（Attribute） | ✅ `genres` |
+| `year` | L104 | `songs.year`（原生列） | ❌ 无需 |
+| `is_public` | L105 | `songs.is_public`（原生列） | ❌ 无需 |
+| `created_at` | L106 | `songs.created_at`（原生列） | ❌ 无需 |
+| `owner_id` | L129 | `$song->owner->public_id` | ✅ `owner` |
+| `is_external` | L130 | `!$song->ownedBy($user)`（`ownedBy()` 比较 `owner->id`） | ✅ `owner` |
+
+> **修正说明**：此前分析误判 `genre` 字段不需要 genres 关联。实际上 `genre` 是一个 Attribute 访问器（[HasSongAttributes.php L69-L77](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/Concerns/Songs/HasSongAttributes.php#L69-L77)），其内部实现是 `$this->genres->pluck('name')->sort()->implode(', ')`，**强依赖 genres 关联的预加载**。如果去掉 genres 的 Eager Load，会触发 N+1 查询——每首歌单独执行 `SELECT * FROM genres JOIN genre_song ...`。
+
+### 4.3 关键属性的调用链追踪
+
+#### 4.3.1 `genre` 字符串的生成链
+
+```
+SongResource: genre
+       ↓
+Song->genre (Attribute, HasSongAttributes.php L69-L77)
+       ↓
+$this->genres  ← 必须是已加载的 Eloquent Collection
+       ↓
+  ->pluck('name')     ← 从每个 Genre 模型取 name 字段
+  ->sort()            ← 字母排序
+  ->implode(', ')     ← 用逗号拼接成字符串
+```
+
+**为什么要排序？**：保证同一组流派在不同数据库、不同返回顺序下，生成的字符串一致，前端展示稳定。
+
+#### 4.3.2 `album_artist` 的生成链
+
+```
+SongResource: album_artist_id / album_artist_name
+       ↓
+Song->album_artist (Attribute, HasSongAttributes.php L20-L23)
+       ↓
+$this->album?->artist  ← 先取 album 关联，再取 album 的 artist 关联
+       ↓
+返回 Artist 模型或 null
+```
+
+这是一个**跨两级关联的访问器**：song → album → artist。Eager Load 时必须写成 `'album.artist'`（嵌套点语法）才能避免 N+1。
+
+> **额外发现**：Album 模型自身也有 `$with = ['artist']`（[Album.php L63](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/Album.php#L63)）。这意味着「仅 Eager Load album」时，Album 查询也会自动带上 artist。因此 Song 的 `$with` 中的 `'album.artist'` 是**冗余声明**——去掉它，album 的 artist 仍然会通过 Album 模型的 $with 自动加载。这是一处「双保险」式的冗余设计。
+
+#### 4.3.3 `ownedBy()` 的实现
+
+```php
+// Song.php L141-L144
+public function ownedBy(User $user): bool
+{
+    return $this->owner->id === $user->id;
+}
+```
+
+通过 `owner` 关联取用户 ID 进行比较。这是一个 **N+1 安全**的方法——前提是 owner 关联已预加载。
+
+### 4.4 智能播放列表场景下的关联裁剪判断
+
+**前提**：智能播放列表查询使用 `Song::query(type: PlayableType::SONG, ...)`，即 `whereNull('podcast_id')`，所有结果都是普通歌曲（非播客剧集）。
+
+| 关联 | 是否必须 | 理由 | 裁剪可行性 |
+|------|:-------:|------|:---------:|
+| `artist` | ✅ 必须 | `artist_name` 输出字段依赖 | ❌ 不可裁剪（但有优化空间：用 `songs.artist_name` 冗余列替代） |
+| `album` | ✅ 必须 | `album_cover` + `album_artist` 依赖 | ❌ 不可裁剪（cover 字段只在 albums 表） |
+| `album.artist` | ✅ 必须 | `album_artist_id` / `album_artist_name` 依赖 | ❌ 不可裁剪（但声明冗余，Album 自身 $with 已包含） |
+| `genres` | ✅ 必须 | `genre` 字符串访问器强依赖 | ❌ 不可裁剪（BelongsToMany，N+1 代价高） |
+| `owner` | ✅ 必须 | `owner_id`（public_id）+ `is_external` 依赖 | ❌ 不可裁剪（public_id 不在 songs 表） |
+| `podcast` | ❌ 不必 | 智能播放列表 type=SONG，`isEpisode()` 恒为 false，播客相关字段永不输出 | ✅ **可安全裁剪** |
+
+**结论：6 个关联中仅有 `podcast` 1 个可以安全裁剪。**
+
+### 4.5 进一步优化的可能性（需改代码）
+
+如果愿意修改 `SongResource` 或 `Song` 模型的实现，还能释放更多裁剪空间：
+
+| 优化方案 | 可裁剪的关联 | 改动点 | 收益 |
+|---------|------------|-------|------|
+| 用 `songs.artist_name` 冗余列替代 `artist->name` | `artist` | SongResource L93 改为 `$this->song->artist_name` | 砍掉 1 条 SQL + N 个 Artist 模型 |
+| 用 `songs.album_name` + 专辑封面缓存路径 | 部分替代 `album` | 需将 cover 文件名也冗余到 songs 表 | 砍掉 album 关联（但改动较大） |
+| 将 genre 字符串持久化到 songs 表的 `genre` 列 | `genres` | 增加冗余列，syncGenres 时同步更新 | 砍掉 2 条 SQL（收益最大，因为 BelongsToMany 有 pivot 查询） |
+| 将 owner 的 public_id 冗余到 songs 表 | `owner` | 增加 `owner_public_id` 列 | 砍掉 1 条 SQL + N 个 User 模型 |
+
+> **权衡分析**：裁剪 `genres` 关联的收益最大（2 条 SQL + 多对多加载开销），但代价是数据冗余和写路径的同步复杂度。在歌曲流派变更不频繁的场景下，这是一个值得考虑的反范式优化。当前 Koel 选择「用 genres 关联实时计算」，是**读性能换写简单性**的折中。
+
+### 4.6 500 行结果集的内存占用估算
+
+| 对象 | 数量 | 单条内存估算 | 总占用 |
+|------|------|------------|-------|
+| Song 模型 | 500 | ~2 KB | ~1 MB |
+| Album 模型 | ~200（估算） | ~1.5 KB | ~300 KB |
+| Artist 模型（歌曲艺术家） | ~80 | ~1 KB | ~80 KB |
+| Artist 模型（专辑艺术家） | ~80 | ~1 KB | ~80 KB |
+| Genre 模型 | ~100（去重后） | ~0.5 KB | ~50 KB |
+| User 模型（owner） | 1（通常） | ~2 KB | ~2 KB |
+| **合计** | ~961 个模型 | | **~1.5 MB** |
+
+Eager Loading 的内存开销约为主查询结果的 50%，但相比 N+1 查询的数据库 round-trip 开销，仍然是值得的。
+
+---
+
+## 五、规则组的括号嵌套机制与 AND/OR 语义正确性
+
+### 5.1 代码中的组合逻辑原语（[SongRepository.php L243-L255](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Repositories/SongRepository.php#L243-L255)）
 
 ```php
 $playlist->rule_groups->each(static function (RuleGroup $group, int $index) use ($query): void {
@@ -304,7 +450,7 @@ $playlist->rule_groups->each(static function (RuleGroup $group, int $index) use 
 });
 ```
 
-### 4.2 Eloquent `where(Closure)` 的括号生成机制
+### 5.2 Eloquent `where(Closure)` 的括号生成机制
 
 当闭包被传入 `where()` 或 `orWhere()` 时，Laravel 的 `Illuminate\Database\Eloquent\Builder` 会执行以下内部逻辑：
 
@@ -330,7 +476,7 @@ $playlist->rule_groups->each(static function (RuleGroup $group, int $index) use 
 主 Builder:  WHERE (...) AND (...) OR (EXISTS (...) AND COALESCE(...) > 100)
 ```
 
-### 4.3 三层括号结构的完整展开
+### 5.3 三层括号结构的完整展开
 
 ```sql
 SELECT songs.*, ...
@@ -366,7 +512,7 @@ ORDER BY songs.title
 LIMIT 500
 ```
 
-### 4.4 语义正确性的三个保障
+### 5.4 语义正确性的三个保障
 
 | 保障机制 | 代码位置 | 防止的问题 |
 |---------|---------|-----------|
@@ -382,9 +528,9 @@ LIMIT 500
 
 ---
 
-## 五、性能权衡的深度审视（修正与补充）
+## 六、性能权衡的深度审视（修正与补充）
 
-### 5.1 此前分析的修正清单
+### 6.1 此前分析的修正清单
 
 | 此前表述 | 修正后表述 | 依据 |
 |---------|-----------|------|
@@ -393,8 +539,10 @@ LIMIT 500
 | 「可查询字段共 12 种」 | **共 11 种 PHP 枚举，其中 10 种对用户开放** | 重新数了 [SmartPlaylistModel.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Enums/SmartPlaylistModel.php#L5-L18) 的 case：11 个 |
 | 「智能播放列表通过 PlayableStore 查询」 | **完整链路还要经过：前端 HTTP 缓存 + 后端 Policy 授权 + SongResource 序列化** | 见 §一 端到端路径 |
 | 「ORDER BY songs.title 需要 title 索引」 | **title 索引也不会生效** | 前面有 `accessible()` 的大量条件和多个 `OR` 组，MySQL 优化器通常选择全表扫描后 filesort；**真正的瓶颈是 WHERE，不是 ORDER BY** |
+| 「genres 关联可以不加载，因为 genre 是访问器」 | **genre 访问器恰恰强依赖 genres 关联集合** | `genre` Attribute 实现为 `$this->genres->pluck('name')->sort()->implode(', ')`（[HasSongAttributes.php](file:///d:/fz/0601-1/solo-dogfeeding/code/19-koel/app/Models/Concerns/Songs/HasSongAttributes.php)），去掉 Eager Load 会触发 N+1 查询 |
+| 「album / artist / owner 等多个关联都可以裁剪」 | **6 个关联中只有 podcast 可安全裁剪** | 逐字段溯源：artist_name 输出用的是关联而非冗余列、album_cover/album_artist 必须走 album 关联、owner 输出 public_id 不在 songs 表。仅 podcast 在 type=SONG 时无数据可裁剪 |
 
-### 5.2 每次查询的性能成本分解
+### 6.2 每次查询的性能成本分解
 
 | 环节 | 耗时占比（估算） | 特点 |
 |------|:---------------:|------|
@@ -404,7 +552,7 @@ LIMIT 500
 | `SongResource::toArray()` 序列化 | ~8% | PHP CPU 瓶颈 |
 | JSON 编码 + HTTP 传输 | ~2% | 网络瓶颈 |
 
-### 5.3 现有优化策略的覆盖范围评估
+### 6.3 现有优化策略的覆盖范围评估
 
 | 优化措施 | 生效范围 | 覆盖到的瓶颈 |
 |---------|---------|-------------|
@@ -415,7 +563,7 @@ LIMIT 500
 | 500 行硬上限 | 全局 | 保护 Eager Loading / 序列化 / 传输 |
 | 前端 `cache.remember('playlist.songs', id)` | 前端二次打开 | 不请求后端（规则变更 / 手动刷新时显式 `cache.remove`） |
 
-### 5.4 现有设计的性能天花板与改进建议
+### 6.4 现有设计的性能天花板与改进建议
 
 #### 天花板 A：全表扫描的不可避免性
 
@@ -464,19 +612,52 @@ LIMIT 500
 - 失效策略：规则变更时（PlaylistObserver）、交互记录变化时（播放/收藏）——但交互变化频率高，建议接受 5 分钟最终一致
 - 版本戳：Playlist 加 `rules_version` 字段，缓存键中携带此版本，规则变更自动失效旧缓存
 
-#### 天花板 C：Song 模型 Eager Loading 的冗余加载
+#### 天花板 C：Eager Loading 的冗余加载与可裁剪空间
 
-`Song::$with = ['album', 'artist', 'album.artist', 'podcast', 'genres', 'owner']` 是全局生效的，即使 API 响应中只用到了 `album_name`（已冗余在 songs 表里）和 `genre`（字符串名，用 genres.name 而非整个模型），关联的 Album / Artist 对象仍然被完整加载并 Hydration。
+`Song::$with = ['album', 'artist', 'album.artist', 'podcast', 'genres', 'owner']` 是全局默认的，对所有 Song 查询生效。对智能播放列表而言，部分关联加载了完整的模型对象，但 API 响应实际只用到其中少数字段。
 
-**改进建议**：
-- 智能播放列表使用 `->without(['album', 'artist', 'album.artist', 'podcast', 'owner'])` 去除不需要的 Eager Load
-- `genres` 也可以不加载，因为 SongResource 中 `'genre'` 用的是 `$song->genre`（拼接成字符串的访问器，不需要整个 Genre 集合）
+**各关联的实际字段用量分析**（详见 四 逐字段溯源）：
 
-可节省约 5 条 SQL 和数千个 Eloquent Model 对象的内存。
+| 关联 | 实际用到的字段/方法 | 完整模型加载量 | 是否必须保留？ |
+|------|---------------------|:-------------:|:-----------:|
+| `artist` | `name` (1 个字段) | 完整 Artist 模型（~10+ 字段） |  必须（但优化空间大） |
+| `album` | `cover` + `artist.id` + `artist.name` | 完整 Album 模型（~15 字段） |  必须（cover 无冗余列） |
+| `album.artist` | `id` + `name` (2 个字段) | 完整 Artist 模型 |  必须（但声明冗余，Album 自身 $with 已包含） |
+| `genres` | `name`（pluck + sort + implode） | 完整 Genre 模型集合 |  必须（但只有 name 列，可进一步裁剪） |
+| `owner` | `public_id` + `id` (2 个字段) | 完整 User 模型（含 email, preferences 等） |  必须（public_id 不在 songs 表） |
+| `podcast` | 无（智能播放列表 type=SONG） | 完整 Podcast 模型（零条记录） |  可裁剪 |
+
+**立即可实施的优化**（按收益/成本排序）：
+
+1. **裁剪 `podcast` 关联**（成本：零成本，一行代码）：
+   ```php
+   $query->without('podcast');
+   ```
+   收益：省 1 条 SQL，虽然结果集为空但仍需一次 round-trip。
+
+2. **用 `songs.artist_name` 冗余列替代 `artist->name`**（成本：极小，改一行 SongResource）：
+   ```php
+   // SongResource L93: 'artist_name' => $this->song->artist?->name,
+   // 改为:
+   'artist_name' => $this->song->artist_name,
+   ```
+   然后 `->without('artist')`。收益：省 1 条 SQL + N 个 Artist 模型。
+   > 一致性保障：`songs.artist_name` 在 INSERT/UPDATE 时与 `artist_id` 同步写入，数据一致性有保障。
+
+3. **清理 `album.artist` 的冗余声明**：Album 模型的 `$with` 已包含 `artist`，Song 的 `$with` 中 `'album.artist'` 是重复声明，可去掉。
+
+4. **genres 关联的字段裁剪**：BelongsToMany 多对多关系可用回调限定列：
+   ```php
+   ->with(['genres' => fn ($q) => $q->select('genres.id', 'genres.name')])
+   ```
+
+5. **owner 关联只加载 public_id**：User 模型关联可用 `->with('owner:id,public_id')` 只取需要的两列。
+
+**中长期可选的反范式优化**（改动大但收益也大）：将 genre 字符串和 owner_public_id 冗余到 songs 表，可砍掉 genres 和 owner 两个关联，省 3 条 SQL。但写路径复杂度会增加同步逻辑（详见 4.5）。
 
 ---
 
-## 六、翻译引擎的边界情况测试验证（来自集成测试）
+## 七、翻译引擎的边界情况测试验证（来自集成测试）
 
 | 测试场景 | 文件与行号 | 验证的翻译正确性 |
 |---------|-----------|----------------|
@@ -496,9 +677,9 @@ LIMIT 500
 
 ---
 
-## 七、总结
+## 八、总结
 
-### 7.1 架构亮点回顾
+### 8.1 架构亮点回顾
 
 1. **翻译器的元数据驱动设计**：`SmartPlaylistModel` 的三个辅助方法（`isDate`/`requiresRawQuery`/`getManyToManyRelation`）作为翻译决策轴，比硬编码 switch 更具扩展性。
 2. **DNF 布尔结构的取舍**：组内 AND、组间 OR 限制了表达力，但换来了可预测的 SQL 形态、简洁的前端 UI 和极小的测试表面积。
@@ -506,7 +687,7 @@ LIMIT 500
 4. **用户上下文三层叠加**：accessible / favorites / play_count 在同一个 Builder 生命周期内一次性配置完毕，后续规则翻译完全不需要感知用户隔离。
 5. **前后端双重硬上限**：后端 500 行 LIMIT + 前端 playableStore 只注册不额外加载，确保大型曲库不会造成前端内存爆炸。
 
-### 7.2 三个值得注意的架构假设
+### 8.2 三个值得注意的架构假设
 
 | 隐含假设 | 当假设不成立时 |
 |---------|--------------|
@@ -514,7 +695,7 @@ LIMIT 500
 | 智能播放列表每次访问都应该实时重算 | 规则不变 + 歌曲库不变时，重复查询产生的浪费是可接受的 |
 | 匹配歌曲数量的排序关键字就是 title | 用户无法按 date_added / play_count / length 等字段排序智能播放列表结果（当前 `getBySmartPlaylist()` 硬编码 `orderBy('songs.title')`） |
 
-### 7.3 对后续扩展的启示
+### 8.3 对后续扩展的启示
 
 若要增加新的可查询字段（例如 `bitrate`、`file_size`、`disc_number`），所需改动极其收敛：
 
