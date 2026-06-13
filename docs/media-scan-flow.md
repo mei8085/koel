@@ -392,13 +392,99 @@ return static::query()->firstOrCreate([
 
 ---
 
-## 九、扫描后清理与保护条件
+## 九、扫描后清理：删除路径、事件断链与监听器职责
 
-扫描完成后触发 `MediaScanCompleted` 事件，三个监听器按注册顺序执行：
+扫描完成后触发 `MediaScanCompleted` 事件，注册了三个监听器（[EventServiceProvider](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Providers/EventServiceProvider.php#L47-L51)）。三者都实现 `ShouldQueue`，按注册顺序派发到队列：
 
-### 9.1 DeleteNonExistingRecordsPostScan — 删除磁盘已删除的歌曲
+```php
+MediaScanCompleted::class => [
+    DeleteNonExistingRecordsPostScan::class,
+    PruneLibrary::class,
+    WriteScanLog::class,
+],
+```
+
+这三个监听器的设计不是随意排列的 —— 它们之间存在**隐含的依赖链**和**职责分工**，根源在于两条删除路径的机制完全不同。
+
+### 9.1 两条删除路径：查询级 vs 模型级
+
+在讲监听器之前，先搞清楚 Koel 中删除歌曲的两种方式及其本质差异。
+
+#### 路径 A：查询级批量删除 — `$query->delete()`
+
+代表：`DeleteNonExistingRecordsPostScan` 中的 `Song::deleteWhereValueNotIn()`
+
+[SupportsDeleteWhereValueNotIn::deleteAndUnsearch](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Models/Concerns/SupportsDeleteWhereValueNotIn.php#L65-L72)
+
+```php
+private static function deleteAndUnsearch(Builder $query): void
+{
+    if (in_array(Searchable::class, class_uses_recursive(static::class), true)) {
+        $query->unsearchable();
+    }
+    $query->delete();
+}
+```
+
+**本质**：调用 Eloquent 查询构造器的 `delete()`，底层直接执行 `DELETE FROM songs WHERE ...` SQL 语句。
+
+**特点**：
+- 不实例化模型对象
+- **不触发**模型的 `deleting` / `deleted` 事件
+- **不触发**模型 Observer（`#[ObservedBy]` 注册的也不触发）
+- **不触发** `LibraryChanged` 等业务事件
+- 不会级联清理关联文件（封面、转码文件等）
+- 性能好，适合大批量删除
+
+#### 路径 B：模型级删除 — `$model->delete()` / `Model::destroy()`
+
+代表：`SongService::deleteSongs()` 中的 `Song::destroy($ids)`
+
+[SongService::deleteSongs](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Services/SongService.php#L192-L214)
+
+```php
+public function deleteSongs(array|string $ids): void
+{
+    $ids = Arr::wrap($ids);
+    $songFiles = Song::query()->findMany($ids)->map(SongFileInfo::fromSong(...));
+    $transcodeFiles = $this->transcodeRepository->findBySongIds($ids)->map(TranscodeFileInfo::fromTranscode(...));
+    if (Song::destroy($ids) === 0) {
+        return;
+    }
+    Dispatcher::dispatch(new DeleteSongFilesJob($songFiles));
+    Dispatcher::dispatch(new DeleteTranscodeFilesJob($transcodeFiles));
+    event(new LibraryChanged());
+}
+```
+
+**本质**：先查出每个模型对象，再逐个调用 `$model->delete()`，走完完整的模型生命周期。
+
+**特点**：
+- 实例化每个模型对象
+- **会触发**模型的 `deleting` / `deleted` 事件
+- **会触发**模型 Observer 的对应方法
+- 手动 `event(new LibraryChanged())` 触发后续清理
+- 会清理关联文件（音频文件、转码文件）
+- 性能开销大，适合小批量用户操作
+
+**关键对比表**：
+
+| 特性 | 查询级删除（扫描清理路径） | 模型级删除（手动删歌路径） |
+|------|--------------------------|--------------------------|
+| 调用方式 | `$query->delete()` | `Model::destroy($ids)` |
+| 模型实例化 | 否 | 是 |
+| 模型事件 | 不触发 | 触发 |
+| Observer | 不触发 | 触发 |
+| LibraryChanged 事件 | 不触发 | 手动触发 |
+| 关联文件清理 | 不清理 | 清理（音频+转码） |
+| 性能 | 高（批量 SQL） | 低（逐条处理） |
+| 适用场景 | 扫描后批量清理 | 用户手动删除 |
+
+### 9.2 DeleteNonExistingRecordsPostScan — 歌曲级清理（第一道）
 
 [DeleteNonExistingRecordsPostScan](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Listeners/DeleteNonExistingRecordsPostScan.php#L18-L30)
+
+**职责**：删除数据库中"磁盘上已不存在"的本地歌曲记录。
 
 ```php
 $paths = $event->results->valid()
@@ -411,28 +497,138 @@ Song::deleteWhereValueNotIn($paths, 'path', static function (Builder $builder): 
 });
 ```
 
-**被保留（不被删除）的歌曲**：
-1. 本次扫描结果为 `valid()` 的歌曲（包含 success 和 skipped 两种状态）—— 即磁盘上存在的文件
-2. 云存储上的歌曲（S3、Dropbox 等）—— 通过 `getAllStoredOnCloud()` 合并进保护列表
-3. 播客节目（`podcast_id IS NOT NULL`）—— 通过 `whereNull('podcast_id')` 排除在删除范围之外
+**保护条件**（三类歌曲不会被删除）：
 
-**删除实现**：使用 `SupportsDeleteWhereValueNotIn` trait 的 `deleteWhereValueNotIn()` 方法，针对 SQL 的 IN 子句 65535 元素限制做了分 chunk 处理。删除前会先调用 `unsearchable()` 从 Scout 搜索索引中移除。
+| 类别 | 方式 | 原因 |
+|------|------|------|
+| 本次扫描 valid 的歌曲 | `$event->results->valid()` | 磁盘上存在，正常保留 |
+| 云存储歌曲 | `getAllStoredOnCloud()` | 不在本地磁盘上，不参与扫描 |
+| 播客节目 | `whereNull('podcast_id')` 排除 | 播客有自己的生命周期，不由媒体扫描管理 |
 
-### 9.2 PruneLibrary — 清理空专辑和空艺人
+**删除后留下的空缺**：
+- 歌曲记录被删了，但 Album/Artist 记录还在（变成"空"实体）
+- 歌曲对应的转码文件还在磁盘上（不会被清理，因为查询级删除不触发文件清理逻辑）
+- 不会触发 `LibraryChanged`，所以后续的 prune 不会自动跟进
+
+这就是为什么需要第二个监听器 `PruneLibrary` —— 它补的就是**查询级删除不触发后续清理**这个空缺。
+
+### 9.3 PruneLibrary — 实体级清理（第二道）
 
 [PruneLibrary](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Listeners/PruneLibrary.php) → [LibraryManager::prune](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Services/LibraryManager.php#L16-L43)
 
-**Album 清理条件**：`LEFT JOIN songs WHERE songs.album_id IS NULL` — 即没有任何歌曲的专辑会被删除。
+**职责**：清理"没有任何歌曲关联"的空 Album 和空 Artist。
 
-**Artist 清理条件**：`LEFT JOIN songs + LEFT JOIN albums WHERE both IS NULL` — 即既没有歌曲也没有专辑的艺人才会被删除。
+```php
+$albumQuery = Album::query()
+    ->leftJoin('songs', 'songs.album_id', '=', 'albums.id')
+    ->whereNull('songs.album_id');
 
-注意：这是全局清理，不区分用户。在 Plus 模式下，如果 Artist/Album 是用户私有的，只有当该用户下的所有相关歌曲都被删除时，对应记录才会被清理。
+$artistQuery = Artist::query()
+    ->leftJoin('songs', 'songs.artist_id', '=', 'artists.id')
+    ->leftJoin('albums', 'albums.artist_id', '=', 'artists.id')
+    ->whereNull('songs.artist_id')
+    ->whereNull('albums.artist_id');
+```
 
-### 9.3 WriteScanLog — 写入同步日志
+- **Album 清理条件**：LEFT JOIN songs 后 `songs.album_id IS NULL` —— 没有任何歌曲的专辑
+- **Artist 清理条件**：LEFT JOIN songs + LEFT JOIN albums 后两者都为 NULL —— 既没有歌曲也没有专辑的艺人
+- 全局清理，不区分用户
+
+**删除方式**：`$albumQuery->delete()` / `$artistQuery->delete()` —— 同样是**查询级删除**。
+
+这意味着 Album/Artist 被 prune 删除时：
+- **不触发** `AlbumObserver::deleted()` / `ArtistObserver::deleted()`
+- **不会清理** Album 封面文件和 Artist 图片文件（Observer 的 deleted 方法负责删文件）
+- 留下的是数据库层面的干净，磁盘上可能残留封面文件
+
+### 9.4 PruneLibrary 为什么要监听两个事件
+
+[EventServiceProvider](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Providers/EventServiceProvider.php#L43-L50)
+
+```php
+LibraryChanged::class => [
+    PruneLibrary::class,
+],
+
+MediaScanCompleted::class => [
+    DeleteNonExistingRecordsPostScan::class,
+    PruneLibrary::class,
+    WriteScanLog::class,
+],
+```
+
+`PruneLibrary` 同时监听 **`LibraryChanged`** 和 **`MediaScanCompleted`** 两个事件，这是因为两条删除路径的事件链不一样：
+
+| 场景 | 删除路径 | 会不会触发 LibraryChanged | PruneLibrary 怎么被唤醒 |
+|------|---------|--------------------------|----------------------|
+| 用户手动删歌 | 模型级删除（`destroy`） | 会（`SongService::deleteSongs` 手动 dispatch） | 通过 `LibraryChanged` 事件 |
+| 扫描后清理 | 查询级删除（`$query->delete()`） | 不会 | 直接挂在 `MediaScanCompleted` 上 |
+
+**一句话总结**：扫描后的批量删除走"查询级"路线，绕过了 `LibraryChanged`，所以 `PruneLibrary` 必须在 `MediaScanCompleted` 上再挂一份，才能补上这段空缺。
+
+### 9.5 WriteScanLog — 日志记录（第三道）
 
 [WriteScanLog](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Listeners/WriteScanLog.php)
 
+**职责**：将扫描结果写入日志文件。与前两个监听器没有依赖关系，纯记录用途。
+
 根据 `config('koel.sync_log_level')` 决定记录全部结果还是仅记录错误，日志文件写入 `storage/logs/sync-YYYYmmdd-His.log`。
+
+### 9.6 三个监听器的依赖关系图
+
+```
+MediaScanCompleted 事件
+  │
+  ├─ [1] DeleteNonExistingRecordsPostScan  (ShouldQueue)
+  │     │
+  │     ├─ 职责: 歌曲级删除 — 移除磁盘已不存在的 Song 记录
+  │     ├─ 方式: 查询级批量删除 ($query->delete())
+  │     ├─ 保护: valid结果 + 云存储歌曲 + 播客节目
+  │     ├─ 不触发: 模型事件 / Observer / LibraryChanged
+  │     │
+  │     └─ 留下的空缺: 孤立 Album/Artist、残留转码文件
+  │                          ↓
+  ├─ [2] PruneLibrary                        (ShouldQueue)
+  │     │
+  │     ├─ 职责: 实体级清理 — 移除空 Album 和空 Artist
+  │     ├─ 方式: 查询级删除 ($query->delete())
+  │     ├─ 不触发: AlbumObserver/ArtistObserver 的 deleted
+  │     ├─ 留下的空缺: 残留封面/图片文件
+  │     │
+  │     └─ 也监听 LibraryChanged 事件 ← 手动删歌走这条
+  │
+  └─ [3] WriteScanLog                        (ShouldQueue)
+        职责: 写入扫描日志（独立，无依赖）
+```
+
+**执行顺序的重要性**：`PruneLibrary` 必须在 `DeleteNonExistingRecordsPostScan` 之后执行，否则孤立体尚未产生，prune 不到东西。由于两者都是 `ShouldQueue` 且按注册顺序派发，在单 worker 的同步队列或 FIFO 队列下顺序有保障；多 worker 并发场景下理论上可能乱序，但 prune 是幂等的 —— 早跑了也不会错删，只是可能啥也没删到。
+
+### 9.7 两条删除路径的完整清理链对比
+
+```
+【用户手动删歌】
+SongService::deleteSongs()
+  → Song::destroy($ids)                    模型级删除
+  → 触发模型事件 / Observer
+  → DeleteSongFilesJob                     删音频文件
+  → DeleteTranscodeFilesJob                删转码文件
+  → event(new LibraryChanged())            ← 触发后续清理
+      → PruneLibrary
+          → LibraryManager::prune()        查询级删除空 Album/Artist
+          → 不触发 Observer deleted        ← 封面文件残留
+
+【扫描后清理】
+MediaScanCompleted 事件
+  → DeleteNonExistingRecordsPostScan
+      → Song::deleteWhereValueNotIn()      查询级批量删除
+      → 不触发模型事件 / Observer
+      → 不触发 LibraryChanged              ← 事件链在这里断了
+      → 不删关联文件                        ← 转码文件残留
+  → PruneLibrary                           ← 直接挂在这里补空缺
+      → LibraryManager::prune()            查询级删除空 Album/Artist
+      → 不触发 Observer deleted            ← 封面文件残留
+  → WriteScanLog
+```
 
 ---
 
@@ -600,6 +796,8 @@ public function remember(string $key, Closure $callback): mixed
 | [ScanResult](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Values/Scanning/ScanResult.php) | 单文件扫描结果 |
 | [ScanResultCollection](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Values/Scanning/ScanResultCollection.php) | 扫描结果集合 |
 | [MediaScanCompleted](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Events/MediaScanCompleted.php) | 扫描完成事件 |
+| [LibraryChanged](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Events/LibraryChanged.php) | 库变更事件（手动删歌触发 PruneLibrary） |
+| [EventServiceProvider](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Providers/EventServiceProvider.php) | 事件-监听器注册 |
 | [DeleteNonExistingRecordsPostScan](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Listeners/DeleteNonExistingRecordsPostScan.php) | 删除无效记录 |
 | [PruneLibrary](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Listeners/PruneLibrary.php) | 清理空专辑/空艺人 |
 | [WriteScanLog](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Listeners/WriteScanLog.php) | 写入扫描日志 |
