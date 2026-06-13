@@ -231,8 +231,9 @@ if (!$config->force && $song && !$song->isFileModified(File::lastModified($path)
 ```
 
 - **目的**：在调用 getID3 解析文件之前快速跳过，避免昂贵的元数据解析开销
-- **判定依据**：`$song->mtime !== File::lastModified($path)`
-- **命中结果**：返回 `ScanResult::skipped($path)`，该路径会被计入 valid 结果，参与后续清理的保护集合
+- **mtime 读取方式**：直接调用 `File::lastModified($path)`（Laravel 封装 `filemtime()`），**无异常兜底**
+- **mtime 读取失败时**：抛出 `Exception` → 被外层 `catch(Throwable)` 捕获 → 整个文件标记为 `ScanResult::error()`
+- **命中结果**：mtime 未变时返回 `ScanResult::skipped($path)`，该路径计入 valid 结果，参与后续清理的保护集合
 
 ### 第二层：SongService::createOrUpdateSongFromScan 中的内部检查
 
@@ -249,8 +250,11 @@ if (!$isFileNewOrModified && !$config->force) {
 ```
 
 - **目的**：对上传场景（`ScansAndStoresSong` trait 调用）等绕过 `IndividualFileHandler` 的调用方提供同样的跳过保护
-- **判定依据**：同样是 mtime 比较，但使用 `ScanInformation` 中的 `mTime` 值
+- **mtime 读取方式**：使用 `ScanInformation.mTime`，其来源是 `get_mtime()` —— 有 `rescue()` 包裹，**失败兜底到 `time()`**
+- **mtime 读取失败时**：返回 `time()`（当前时间戳）→ 必然与旧 mtime 不同 → 判定为"已修改" → 正常解析更新
 - **命中结果**：直接返回现有 Song 对象，但不计入 skipped 结果（上传场景不需要 skipped 统计）
+
+> **两条跳过路径的 mtime 行为差异**详见 5.3 节。核心结论：对已有歌曲，如果 `File::lastModified()` 失败，文件在第一层预检查就被标为 error，根本到不了第二层。`get_mtime()` 的 `time()` 兜底只对新文件和 force 模式有效。
 
 ### Song::isFileModified 方法
 
@@ -511,6 +515,88 @@ Song::deleteWhereValueNotIn($paths, 'path', static function (Builder $builder): 
 - 不会触发 `LibraryChanged`，所以后续的 prune 不会自动跟进
 
 这就是为什么需要第二个监听器 `PruneLibrary` —— 它补的就是**查询级删除不触发后续清理**这个空缺。
+
+### 9.2.1 边缘情况：读不到 mtime 的已有歌曲会被当成失踪记录删除
+
+这是扫描流程中一个危险的边缘情况，需要专门说明。
+
+#### ScanResult 类型与 valid() 集合
+
+[ScanResult](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Values/Scanning/ScanResult.php) 有三种类型：
+
+```php
+enum ScanResultType: string
+{
+    case SUCCESS = 'Success';
+    case ERROR = 'Error';
+    case SKIPPED = 'Skipped';
+}
+```
+
+`isValid()` 方法的定义（[ScanResult::isValid](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Values/Scanning/ScanResult.php#L45-L48)）：
+
+```php
+public function isValid(): bool
+{
+    return $this->isSuccess() || $this->isSkipped();
+}
+```
+
+**关键事实**：`ERROR` 类型的结果不在 `valid()` 集合中。
+
+[ScanResultCollection::valid](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Values/Scanning/ScanResultCollection.php#L14-L18) 只是简单过滤：
+
+```php
+public function valid(): Collection
+{
+    return $this->filter(static fn (ScanResult $result): bool => $result->isValid());
+}
+```
+
+#### 完整链路：读不到 mtime → error → 被删除
+
+对**已有歌曲**（数据库中已存在、磁盘上文件也存在）来说，如果第一层预检查时 `File::lastModified()` 失败（典型场景：Windows 下 Unicode 文件名），会发生以下连锁反应：
+
+```
+已有歌曲，文件还在磁盘上
+  ↓
+IndividualFileHandler::handle($path)
+  ├─ $song = songRepository->findOneByPath($path)  ✓ 找到记录
+  │
+  ├─ 第一层预检查
+  │    ├─ File::lastModified($path)  →  抛异常（比如 Unicode 文件名）
+  │    └─ 被 catch (Throwable $e) 捕获
+  │
+  └─ return ScanResult::error($path, $e->getMessage())
+          ↓
+        ScanResultCollection 中记录为 ERROR 类型
+          ↓
+        $event->results->valid()  →  不包含这个 ERROR 的 path
+          ↓
+        DeleteNonExistingRecordsPostScan 构建保护集合
+          ↓
+        该 path 不在保护集合中 → 被判定为"磁盘已删除"
+          ↓
+        Song::deleteWhereValueNotIn()  →  从数据库中删除
+          ↓
+        【后果】磁盘上文件还在，但数据库记录没了！
+```
+
+#### 为什么会这样
+
+原因在于两层设计的不匹配：
+
+1. **第一层预检查**用 `File::lastModified()` 无兜底 —— 失败直接抛异常 → `error`
+2. **valid() 集合**只包含 `success` 和 `skipped` —— `error` 被排除
+3. **删除逻辑**以 valid() 集合为保留名单 —— `error` 的 path 会被删
+
+这三个设计单独看都合理，但组合起来就产生了这个边缘情况：**临时读不到 mtime 的已有歌曲会被当成失踪记录删掉**。
+
+#### 与新文件的对比
+
+如果是**新文件**（数据库中不存在），第一层预检查中的 `$song` 为 null，不会执行 `File::lastModified()`，也就不会触发这个问题。文件会正常进入 `FileScanner::scan()`，那里的 `get_mtime()` 有 `rescue()` 兜底到 `time()`，能正常处理。
+
+只有**已有歌曲**且 `File::lastModified()` 失败时才会落入这个陷阱。
 
 ### 9.3 PruneLibrary — 实体级清理（第二道）
 
