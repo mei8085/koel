@@ -170,9 +170,25 @@ scan(path) → ScanInformation
 - 非 UTF-8 原始字节 → 尝试从 GB18030/Windows-1252 转换
 - 双重乱码（"double mojibake"）→ 逆向还原后重新编码
 
-### 5.3 mtime 的获取与兜底
+### 5.3 mtime 的两种读取路径
 
-[get_mtime](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Helpers.php#L120-L126)
+扫描流程中读取文件 mtime 的地方有两处，使用**不同的函数**，失败时的行为完全不同。
+
+#### 路径 A：IndividualFileHandler 预检查 — `File::lastModified()`
+
+[IndividualFileHandler::handle](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Services/Scanners/IndividualFileHandler.php#L25)
+
+```php
+if (!$config->force && $song && !$song->isFileModified(File::lastModified($path))) {
+```
+
+- 使用 `File::lastModified($path)`，这是 Laravel 对 `filemtime()` 的封装，**失败时抛出异常**
+- 异常被外层 `catch (Throwable $e)` 捕获 → 返回 `ScanResult::error($path, $e->getMessage())`
+- **结果**：读不到 mtime 的已有文件 → 整个文件被标记为 error，不进入解析阶段
+
+#### 路径 B：ScanInformation 构造 — `get_mtime()`
+
+[ScanInformation::fromGetId3Info](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Values/Scanning/ScanInformation.php#L81) → [get_mtime](file:///d:/fz/0601-1/solo-dogfeeding/code/45-koel/app/Helpers.php#L120-L126)
 
 ```php
 function get_mtime(string|SplFileInfo $path): int
@@ -182,10 +198,21 @@ function get_mtime(string|SplFileInfo $path): int
 }
 ```
 
-关键点：
-- 使用 `rescue()` 捕获异常（Windows 下 Unicode 文件名可能导致 `File::lastModified()` 失败）
-- **兜底值为 `time()`（当前时间戳）** — 这意味着读不到 mtime 的文件会永远被判定为"已修改"，每次扫描都会重新解析
-- `IndividualFileHandler` 中的第一层跳过判断也使用 `File::lastModified($path)` 直接比较，走同一条逻辑
+- 使用 `rescue()` 包裹 `File::lastModified()`，**失败时不抛异常，返回 `time()`（当前时间戳）**
+- **结果**：读不到 mtime 的文件 → mTime 为当前时间 → 必然与数据库中存储的旧 mtime 不同 → 文件被判定为"已修改" → 正常解析并更新
+
+#### 两条路径的关系
+
+路径 A 在路径 B 之前执行。对**已有歌曲**而言：
+
+| 场景 | 路径 A（预检查） | 路径 B（元数据阶段） | 最终结果 |
+|------|-----------------|---------------------|---------|
+| mtime 正常读取 | 成功跳过或继续 | 不涉及（已跳过）或正常读取 | 正常 |
+| mtime 读取失败 | `File::lastModified()` 抛异常 → **error** | 不会到达 | 文件标记为 error，不解析 |
+| 新文件（库中无记录） | 预检查不适用（`$song` 为 null） | `get_mtime()` → `time()` | 正常解析，mtime 写入当前时间 |
+| force 模式 | 预检查被跳过 | `get_mtime()` → `time()` | 正常解析 |
+
+关键结论：`get_mtime()` 的 `time()` 兜底只在路径 A 不适用时（新文件、force 模式）才会生效。对已有歌曲，如果 `File::lastModified()` 失败，文件在路径 A 就已经被标为 error，根本到不了路径 B。
 
 ---
 
